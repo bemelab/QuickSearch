@@ -15,7 +15,7 @@ and used for image thumbnails in the preview pane and the EXIF "date taken" of p
 * Select results (Ctrl/Shift+click, Ctrl+A) and press Del to move them to the
   Recycle Bin after a confirmation.
 * Preview pane (right of the results, "Preview" checkbox): image thumbnail with EXIF
-  date, the start of text/code files, the first page of a PDF, folder contents.
+  date, the start of text/code files, PDF pages as images (◀ ▶ pages, Image/Text), folder contents.
 * "Search all roots" combines several indexed folders (e.g. H:\\ and D:\\); "Roots…"
   adds / removes them. Merged results show absolute folders; Sort and Max results
   apply to the merged list. Auto-refresh also keeps the other roots' indexes fresh.
@@ -138,6 +138,10 @@ def parse_query(q):
         raw = quoted if quoted else word
         if not quoted and raw.lower().startswith("ext:"):
             exts += [x.strip(". ").lower() for x in raw[4:].split(",") if x.strip(". ")]
+            continue
+        m = None if (quoted or neg) else re.fullmatch(r"\*\.([^\s*?.\\/]+)", raw)
+        if m:  # "*.pdf" = files with that extension (not "contains .pdf" like .pdfbox or Pdf.dll)
+            exts.append(m.group(1).lower())
             continue
         t = fold(raw).strip()
         if t:
@@ -1404,7 +1408,112 @@ def _exif_taken(im):
         return None
 
 
-def build_preview(path, isdir, ext, size, box, pdftotext):
+PDF_RENDER_PS1 = r"""param([string]$Pdf, [int]$Page = 0, [string]$Out, [int]$Width = 700)
+# Renders one PDF page to PNG with the built-in Windows PDF engine (Windows.Data.Pdf). Prints PAGES=<n>.
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$m = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }
+$asOp = $m | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } | Select-Object -First 1
+$asAct = $m | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' } | Select-Object -First 1
+function Await($op, [Type]$t) { $task = $asOp.MakeGenericMethod($t).Invoke($null, @($op)); [void]$task.Wait(-1); $task.Result }
+function AwaitAction($a) { [void]$asAct.Invoke($null, @($a)).Wait(-1) }
+[void][Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+[void][Windows.Storage.StorageFolder, Windows.Storage, ContentType = WindowsRuntime]
+[void][Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime]
+[void][Windows.Data.Pdf.PdfPageRenderOptions, Windows.Data.Pdf, ContentType = WindowsRuntime]
+[void][Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Pdf)) ([Windows.Storage.StorageFile])
+$doc = Await ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
+"PAGES=" + $doc.PageCount
+if ($Page -ge $doc.PageCount) { $Page = $doc.PageCount - 1 }
+$p = $doc.GetPage([uint32]$Page)
+$opts = New-Object Windows.Data.Pdf.PdfPageRenderOptions
+$opts.DestinationWidth = [uint32]$Width
+$folder = Await ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync((Split-Path -Parent $Out))) ([Windows.Storage.StorageFolder])
+$outFile = Await ($folder.CreateFileAsync((Split-Path -Leaf $Out), [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
+$stream = Await ($outFile.OpenAsync([Windows.Storage.FileAccessMode]::ReadWrite)) ([Windows.Storage.Streams.IRandomAccessStream])
+try { AwaitAction ($p.RenderToStreamAsync($stream, $opts)) } finally { $stream.Dispose(); $p.Dispose() }
+"OK"
+"""
+PDF_THUMB_DIR = os.path.join(DATA_DIR, "pdfpages")
+PDF_THUMB_KEEP = 400
+
+
+def render_pdf_page(path, page, width):
+    """Render one PDF page to a cached PNG with Windows.Data.Pdf (built into Windows 10/11,
+    driven through Windows PowerShell 5.1). Returns (png_path, page_count). Raises on failure."""
+    path = os.path.normpath(os.path.abspath(path))
+    thumb_dir = os.path.normpath(os.path.abspath(PDF_THUMB_DIR))  # Windows APIs want backslashes
+    os.makedirs(thumb_dir, exist_ok=True)
+    st = os.stat(path)
+    width = max(200, min(1600, int(width) // 50 * 50))  # coarse widths keep the cache useful
+    key = hashlib.md5(f"{os.path.normcase(path)}|{st.st_mtime}|{st.st_size}|{page}|{width}".encode("utf-8")).hexdigest()
+    with _PDF_LOCKS_GUARD:
+        lock = _PDF_LOCKS.setdefault(key, threading.Lock())
+    with lock:  # the same page requested twice at once is rendered only once
+        return _render_pdf_page_locked(path, page, width, key, thumb_dir)
+
+
+_PDF_LOCKS = {}
+_PDF_LOCKS_GUARD = threading.Lock()
+
+
+def _render_pdf_page_locked(path, page, width, key, thumb_dir):
+    png = os.path.join(thumb_dir, key + ".png")
+    meta = png + ".pages"
+    if os.path.isfile(png) and os.path.isfile(meta):
+        try:
+            os.utime(png, None)
+            with open(meta, encoding="ascii") as f:
+                return png, int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            pass
+    ps1 = os.path.join(DATA_DIR, "pdf_render.ps1")
+    try:
+        with open(ps1, encoding="utf-8") as f:
+            same = f.read() == PDF_RENDER_PS1
+    except OSError:
+        same = False
+    if not same:
+        with open(ps1, "w", encoding="utf-8") as f:
+            f.write(PDF_RENDER_PS1)
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0",
+                       "powershell.exe")
+    tmp = os.path.join(thumb_dir, f"{key}.{os.getpid()}.{threading.get_ident()}.tmp.png")
+    try:
+        r = subprocess.run([exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps1,
+                            "-Pdf", path, "-Page", str(page), "-Out", tmp, "-Width", str(width)],
+                           capture_output=True, timeout=45, creationflags=CREATE_NO_WINDOW)
+        enc = "oem" if os.name == "nt" else "utf-8"  # Windows PowerShell writes in the console code page
+        out = r.stdout.decode(enc, "replace") + r.stderr.decode(enc, "replace")
+        m = re.search(r"PAGES=(\d+)", out)
+        if r.returncode != 0 or not m or not os.path.isfile(tmp):
+            lines = [x.strip() for x in out.splitlines() if x.strip() and not x.startswith("PAGES=")]
+            raise RuntimeError(lines[0][:200] if lines else f"renderer exit code {r.returncode}")
+        os.replace(tmp, png)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    pages = int(m.group(1))
+    with open(meta, "w", encoding="ascii") as f:
+        f.write(str(pages))
+    try:  # keep the cache small: newest PDF_THUMB_KEEP pages
+        files = sorted((e for e in os.scandir(thumb_dir) if e.name.endswith(".png") and ".tmp." not in e.name),
+                       key=lambda e: e.stat().st_mtime, reverse=True)
+        for e in files[PDF_THUMB_KEEP:]:
+            for fn in (e.path, e.path + ".pages"):
+                try:
+                    os.remove(fn)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return png, pages
+
+
+def build_preview(path, isdir, ext, size, box, pdftotext, pdf_page=0, pdf_mode="image"):
     """Compute preview content (runs in a worker thread). Returns a dict:
     kind 'image' (image = PIL image fitted in box) / 'text' / 'info', text, extra (list of str),
     taken (EXIF timestamp or None)."""
@@ -1485,12 +1594,30 @@ def build_preview(path, isdir, ext, size, box, pdftotext):
                 res["extra"].append(f"Beginning of the file shown (max {PREVIEW_TEXT_LINES} lines / 64 KB)")
             res.update(kind="text", text="\n".join(lines) if lines else "(empty file)")
             return res
+        if ext == "pdf" and pdf_mode == "image":
+            try:
+                png, pages = render_pdf_page(path, pdf_page, box[0])
+                page = min(pdf_page, max(0, pages - 1))
+                res["pages"], res["page"] = pages, page
+                pil = pil_modules()
+                if pil:
+                    with pil[0].open(png) as im:
+                        im2 = im.convert("RGB")
+                    im2.thumbnail(box)
+                    res.update(kind="image", image=im2)
+                else:
+                    res.update(kind="image", image_file=png)
+                res["extra"].append(f"Page {page + 1} of {pages}")
+                return res
+            except Exception as ex:  # fall back to the text of the page
+                res["extra"].append(f"Page image not available ({str(ex)[:80]}) - text shown")
         if ext == "pdf":
             if not pdftotext:
                 res["text"] = "PDF text needs pdftotext (comes with Git for Windows)."
                 return res
             try:
-                r = subprocess.run([pdftotext, "-q", "-l", "1", "-enc", "UTF-8", path, "-"],
+                pg = str(pdf_page + 1)
+                r = subprocess.run([pdftotext, "-q", "-f", pg, "-l", pg, "-enc", "UTF-8", path, "-"],
                                    capture_output=True, timeout=15, creationflags=CREATE_NO_WINDOW)
                 text = decode_text(r.stdout[:PREVIEW_TEXT_BYTES], truncated=len(r.stdout) > PREVIEW_TEXT_BYTES)
             except subprocess.TimeoutExpired:
@@ -1498,9 +1625,9 @@ def build_preview(path, isdir, ext, size, box, pdftotext):
                 return res
             text = text.replace("\x00", "").replace("\f", "").strip()
             if not text:
-                res["text"] = "This PDF has no text layer on page 1 (scanned PDF?)."
+                res["text"] = f"This PDF has no text layer on page {pdf_page + 1} (scanned PDF?)."
             else:
-                res["extra"].append("Text of page 1")
+                res["extra"].append(f"Text of page {pdf_page + 1}")
                 res.update(kind="text", text=text)
             return res
         res["text"] = f"No preview for .{ext} files." if ext else "No preview for this file type."
@@ -5104,9 +5231,23 @@ class App(tk.Tk):
         self.pv_b_open.pack(side="left")
         self.pv_b_reveal = ttk.Button(btns, text="Show in Explorer", command=self._pv_reveal, state="disabled")
         self.pv_b_reveal.pack(side="left", padx=4)
+        self.pv_pdfbar = ttk.Frame(pv)  # shown only for PDFs
+        self.pv_b_prev = ttk.Button(self.pv_pdfbar, text="◀", width=3, command=lambda: self._pv_pdf_step(-1))
+        self.pv_b_prev.pack(side="left")
+        self.v_pv_page = tk.StringVar()
+        ttk.Label(self.pv_pdfbar, textvariable=self.v_pv_page, width=13, anchor="center").pack(side="left")
+        self.pv_b_next = ttk.Button(self.pv_pdfbar, text="▶", width=3, command=lambda: self._pv_pdf_step(1))
+        self.pv_b_next.pack(side="left")
+        self.v_pdf_mode = tk.StringVar(value=self.settings.get("pdf_preview", "image"))
+        for val, txt in (("image", "Page image"), ("text", "Text")):
+            ttk.Radiobutton(self.pv_pdfbar, text=txt, value=val, variable=self.v_pdf_mode,
+                            command=self._pv_pdf_mode_changed).pack(side="left", padx=(8, 0))
+        self._pv_pdf_page, self._pv_pdf_pages, self._pv_pdf_path = 0, 0, None
+        self._pv_is_pdf = False
         self.pv_body = ttk.Frame(pv)
         self.pv_body.pack(fill="both", expand=True)
-        self.pv_img = ttk.Label(self.pv_body, anchor="center")
+        self.pv_img = ttk.Label(self.pv_body, anchor="center", cursor="hand2")
+        self.pv_img.bind("<Double-1>", lambda e: self._pv_open())
         self.pv_textf = ttk.Frame(self.pv_body)
         self.pv_text = tk.Text(self.pv_textf, font=("Consolas", 9), wrap="none", width=40, height=10,
                                relief="flat", background="#fbfbfb", state="disabled")
@@ -5197,6 +5338,8 @@ class App(tk.Tk):
     def _pv_clear(self, text):
         self._pv_path = None
         self._pv_kind = None
+        self._pv_is_pdf = False
+        self.pv_pdfbar.pack_forget()
         for v in (self.v_pv_name, self.v_pv_path, self.v_pv_info, self.v_pv_extra):
             v.set("")
         self.pv_b_open.configure(state="disabled")
@@ -5237,11 +5380,22 @@ class App(tk.Tk):
         self.v_pv_extra.set("")
         self.pv_b_open.configure(state="normal")
         self.pv_b_reveal.configure(state="normal")
+        ext = (r[2] or "").lower()
+        is_pdf = ext == "pdf" and not r[5]
+        self._pv_is_pdf = is_pdf
+        if is_pdf:
+            if path != self._pv_pdf_path:
+                self._pv_pdf_path, self._pv_pdf_page, self._pv_pdf_pages = path, 0, 0
+            self._pv_pdf_bar_update(loading=True)
+            self.pv_pdfbar.pack(fill="x", pady=(0, 4), before=self.pv_body)
+        else:
+            self.pv_pdfbar.pack_forget()
         box = self._pv_box_size()
         self._pv_box = box
         self._pv_kind = "loading"
-        self._pv_set_text("Loading preview…")
-        args = (path, bool(r[5]), (r[2] or "").lower(), r[3] or 0, box, self.pdftotext)
+        self._pv_set_text("Rendering page…" if is_pdf and self.v_pdf_mode.get() == "image" else "Loading preview…")
+        args = (path, bool(r[5]), ext, r[3] or 0, box, self.pdftotext,
+                self._pv_pdf_page if is_pdf else 0, self.v_pdf_mode.get())
 
         def work():
             p = build_preview(*args)
@@ -5249,7 +5403,44 @@ class App(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _pv_pdf_bar_update(self, loading=False):
+        n, i = self._pv_pdf_pages, self._pv_pdf_page
+        self.v_pv_page.set(f"Page {i + 1} / {n}" if n else f"Page {i + 1}")
+        self.pv_b_prev.configure(state="normal" if i > 0 and not loading else "disabled")
+        self.pv_b_next.configure(state="normal" if (not n or i < n - 1) and not loading else "disabled")
+
+    def _pv_pdf_step(self, d):
+        new = self._pv_pdf_page + d
+        if new < 0 or (self._pv_pdf_pages and new >= self._pv_pdf_pages):
+            return
+        self._pv_pdf_page = new
+        self._preview_request()
+
+    def _pv_pdf_mode_changed(self):
+        self.settings["pdf_preview"] = self.v_pdf_mode.get()
+        self._save_settings()
+        self._preview_request()
+
     def _preview_show(self, p):
+        if "pages" in p:
+            self._pv_pdf_pages = p["pages"]
+            self._pv_pdf_page = p.get("page", self._pv_pdf_page)
+        if self._pv_is_pdf:
+            self._pv_pdf_bar_update()
+        if p["kind"] == "image" and p.get("image_file"):  # no Pillow: Tk reads the PNG itself
+            try:
+                photo = tk.PhotoImage(file=p["image_file"])
+                f = max(1, -(-photo.width() // max(1, self._pv_box[0])), -(-photo.height() // max(1, self._pv_box[1])))
+                photo = photo.subsample(f) if f > 1 else photo
+                self.pv_textf.pack_forget()
+                self._pv_photo = photo
+                self.pv_img.configure(image=photo)
+                self.pv_img.pack(fill="both", expand=True)
+                self.v_pv_extra.set("  ·  ".join(p.get("extra") or []))
+                self._pv_kind = "image"
+                return
+            except tk.TclError as ex:
+                p = dict(p, kind="info", text=f"Cannot show the page image: {ex}")
         extra = list(p.get("extra") or [])
         if p.get("taken"):
             extra.insert(0, "Taken " + self.fmt_time(p["taken"]))
@@ -6111,7 +6302,9 @@ class App(tk.Tk):
             "  is no Recycle Bin - you get an extra PERMANENT-delete warning.\n\n"
             "PREVIEW  (checkbox at the top) shows the selected item on the right:\n"
             "  image thumbnail + EXIF date (needs Pillow), the start of text/code\n"
-            "  files, page 1 of a PDF, the contents of a folder. Drag the divider\n"
+            "  files, PDF pages as images (built-in Windows PDF engine) with\n"
+            "  ◀ ▶ page buttons and a Page image / Text switch (double-click the\n"
+            "  page to open the PDF), the contents of a folder. Drag the divider\n"
             "  to resize it.\n\n"
             "README HINTS  lines of the README knowledge map that mention your\n"
             "  words. Double-click one to search only inside that folder.\n\n"

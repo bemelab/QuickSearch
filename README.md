@@ -6,7 +6,7 @@ QuickSearch indexes every file and folder name once (SQLite, stored in `%LOCALAP
 
 ## Features
 
-- **Instant name / path search** — all words must match, `"exact phrase"`, `-exclude`, `*` / `?` wildcards, `ext:pdf,docx`, optional regex. Case- and Turkish-accent-insensitive (`vinc` finds `Vinç`, `dugun` finds `DÜĞÜN`).
+- **Instant name / path search** — all words must match, `"exact phrase"`, `-exclude`, `*` / `?` wildcards, `*.pdf` or `ext:pdf,docx` for file types, optional regex. Case- and Turkish-accent-insensitive (`vinc` finds `Vinç`, `dugun` finds `DÜĞÜN`).
 - **File-contents search** — inside text and source files (asm, c, bas, py, html, …), Word / Excel / PowerPoint, OpenDocument, RTF and optionally PDFs (via `pdftotext`), with the matching text shown.
 - **Content index (full text)** — a per-root SQLite FTS5 index (`index_<hash>_content.sqlite` next to the name index) of text/code files, PDFs (all pages), `docx` / `xlsx` / `pptx`, `odt` / `ods` / `odp` and RTF, built in the background after indexing: incremental (only new / changed documents, deleted ones removed), low priority, cancelable, progress in the status line. *File contents* searches become instant and support whole words, `"phrases"`, `-exclude` and `prefix*` (Turkish-accent-insensitive), combined with all filters, sort, result limit and all-roots; documents not indexed yet are scanned live ("indexed + live"). Regex searches keep using the live scan. On/off in `Settings…` (default on); without FTS5 in Python's SQLite the live scan is used.
 - **Live updates** — while the program runs, the searched roots are watched (`ReadDirectoryChangesW`): created / changed / renamed / moved / deleted files and folders reach the index within seconds, photo dates and the content index follow. `● live` in the status bar; "index changed – search again" when results on screen may be outdated. Drives that cannot be watched fall back to Auto-refresh; after a flood of changes the root is re-indexed in the background. On/off in `Settings…` (default on).
@@ -15,7 +15,7 @@ QuickSearch indexes every file and folder name once (SQLite, stored in `%LOCALAP
 - **Photo "date taken"** — switch *Date* to *Taken (photos)* to filter and sort by the EXIF date of jpg / tif / png / heic photos; the dates are read in the background after indexing (incremental, cancelable; needs Pillow).
 - **Sort** — best match, newest, oldest, name, size or folder; applied to all matches before the result limit, with an "N of M matches" status.
 - **Search history and saved searches** — the search box drops down the last 30 searches; `☆ Save` stores the complete search (query, filters, sort, all-roots) under a name, `Saved` restores and runs it, `Manage…` renames / reorders / deletes.
-- **Preview pane** — image thumbnails with EXIF "date taken", the start of text/code files, the first page of PDFs, folder contents.
+- **Preview pane** — image thumbnails with EXIF "date taken", the start of text/code files, PDF pages rendered as images by the built-in Windows PDF engine (page by page, or their text), folder contents.
 - **Several roots at once** — index and search multiple drives/folders together (`Roots…`, `Search all roots`).
 - **Disk space view** (`Space…`) — biggest files, biggest folders as an expandable tree (sizes include all subfolders, % of parent) and totals per type category / extension, within the current filters.
 - **Duplicate finder** — groups identical files (size → BLAKE2b hash of the first 64 KB → full-file hash), helps select the extra copies, never deletes the last copy.
