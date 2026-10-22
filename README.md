@@ -34,6 +34,14 @@ QuickSearch indexes every file and folder name once (SQLite, stored in `%LOCALAP
 
 ## Usage
 
+**Taskbar / Start menu:** build the small launcher once and pin `QuickSearch.exe` (pinning a `.pyw` shortcut directly often pins only `pythonw.exe`):
+
+```
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /win32icon:QuickSearch.ico /reference:System.Windows.Forms.dll /out:QuickSearch.exe launcher.cs
+```
+
+The launcher finds `pythonw.exe` and starts `QuickSearch.pyw` from its own folder.
+
 Double-click `QuickSearch.pyw`, or create a shortcut to:
 
 ```

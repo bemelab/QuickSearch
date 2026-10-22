@@ -4,3 +4,4 @@ __pycache__/
 *.sqlite.building
 *.bak
 *.csv
+QuickSearch.exe

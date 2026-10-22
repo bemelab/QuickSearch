@@ -3680,6 +3680,12 @@ class App(tk.Tk):
     def __init__(self, scope=None):
         super().__init__()
         self.title(APP)
+        try:  # window / taskbar icon (QuickSearch.ico next to this script, if present)
+            ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "QuickSearch.ico")
+            if os.path.isfile(ico):
+                self.iconbitmap(default=ico)
+        except tk.TclError:
+            pass
         self.geometry("1250x780")
         self.minsize(960, 560)
         try:
