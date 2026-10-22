@@ -31,24 +31,42 @@ and used for image thumbnails in the preview pane and the EXIF "date taken" of p
 * Right-click > Rename… (F2) / Move to… / Copy to… for files and folders, with a
   confirmation, Skip / Keep both / Overwrite for existing names, copy-then-delete between
   drives and the index updated accordingly.
+* Content index: a full-text index (SQLite FTS5, one ..._content.sqlite per root next to the
+  name index) of text/code files, PDFs (pdftotext), Word/Excel/PowerPoint (docx/xlsx/pptx),
+  OpenDocument (odt/ods/odp) and RTF, built in the background after indexing (incremental,
+  cancelable, low priority). "File contents" searches use it (words, "phrase", -exclude,
+  prefix*); files not indexed yet are scanned live. Settings… > Content index turns it off.
+* Live updates: while the program runs, the searched roots are watched (ReadDirectoryChangesW)
+  and the index follows new / changed / renamed / deleted files and folders within seconds
+  ("● live" in the status bar). Drives that cannot be watched fall back to Auto-refresh.
+* Settings… > Explorer: adds / removes a "QuickSearch here" entry in the Explorer right-click
+  menu of folders, folder backgrounds and drives (per-user registry keys, only on request).
+  It starts this script with --scope "<folder>": Look in is set to that folder (the root is
+  switched, or the folder / its drive is added as a new root after asking).
 """
 
 import calendar
+import codecs
 import collections
 import csv
 import datetime
 import hashlib
+import html
 import json
 import os
 import queue
 import re
 import shutil
 import sqlite3
+import stat
+import struct
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
+import zipfile
+import zlib
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -335,6 +353,7 @@ def _walk(root, include_system=False):
                     continue
 
 
+FILES_REL_INDEX_SQL = "CREATE INDEX IF NOT EXISTS files_rel ON files(rel COLLATE NOCASE)"
 EXIF_TABLE_SQL = "CREATE TABLE IF NOT EXISTS exif(rel TEXT PRIMARY KEY, taken REAL, mtime REAL)"
 # images whose EXIF "date taken" is read in the background (HEIC only if Pillow can open it)
 EXIF_EXTS = ("jpg", "jpeg", "jpe", "tif", "tiff", "heic", "heif", "png", "webp")
@@ -348,17 +367,20 @@ def has_table(con, name, schema="main"):
         return False
 
 
-def files_source(o, exif_ok, schema=""):
+def files_source(o, exif_ok, schema="", file_mtime=False):
     """FROM-clause source for a search. With the 'Taken (photos)' date mode it is the files
     table joined with the EXIF dates, the date column (mtime) being the date taken; files
-    without an EXIF date (or an index without the exif table) give no rows."""
+    without an EXIF date (or an index without the exif table) give no rows.
+    file_mtime=True adds a column file_mtime = the file's modification time in both modes."""
     t = schema + "files"
+    fm = ", mtime AS file_mtime" if file_mtime else ""
     if o.get("date_field") != "taken":
-        return t
+        return f"(SELECT *{fm} FROM {t})" if file_mtime else t
     if not exif_ok:
-        return f"(SELECT * FROM {t} WHERE 0)"
-    return (f"(SELECT f.rel AS rel, f.name AS name, f.ext AS ext, f.size AS size, e.taken AS mtime, "
-            f"f.isdir AS isdir, f.fname AS fname, f.fpath AS fpath FROM {t} f "
+        return f"(SELECT *{fm} FROM {t} WHERE 0)"
+    return ("(SELECT f.rel AS rel, f.name AS name, f.ext AS ext, f.size AS size, e.taken AS mtime, "
+            "f.isdir AS isdir, f.fname AS fname, f.fpath AS fpath"
+            + (", f.mtime AS file_mtime" if file_mtime else "") + f" FROM {t} f "
             f"JOIN {schema}exif e ON e.rel = f.rel WHERE e.taken IS NOT NULL AND f.isdir = 0)")
 
 
@@ -399,6 +421,7 @@ def build_index(root, db_path, progress=None, cancel=None, include_system=False)
     con.executemany("INSERT INTO meta VALUES (?,?)",
                     [("root", root), ("built", str(time.time())), ("count", str(n)),
                      ("system", "1" if include_system else "0")])
+    con.execute(FILES_REL_INDEX_SQL)  # fast single-item lookups for live updates
     con.execute(EXIF_TABLE_SQL)
     con.commit()
     if os.path.isfile(db_path):  # keep the photo dates already read for unchanged files
@@ -572,13 +595,14 @@ def search_contents(db_path, root, o, pdftotext, cancel, emit, progress):
         include, exclude = [], []
     elif not include:
         return 0, 0, "Type at least one word to look for inside files."
-    allowed = set(TEXT_EXTS)
+    allowed = set(TEXT_EXTS) | set(OFFICE_EXTS)
     if o.get("pdf") and pdftotext:
         allowed.add("pdf")
     where, params = filter_clauses(o, exts, restrict_exts=allowed)
     where.append("isdir = 0")
-    where.append("size <= ?")
-    params.append(MAX_TEXT_BYTES if not o.get("pdf") else 200 * 1048576)
+    where.append("size <= CASE WHEN ext = 'pdf' THEN ? WHEN ext IN (%s) THEN ? ELSE ? END"
+                 % ",".join("?" * len(OFFICE_EXTS)))
+    params += [200 * 1048576] + sorted(OFFICE_EXTS) + [CONTENT_MAX_BYTES["office"], MAX_TEXT_BYTES]
     con = _connect(db_path)
     try:
         src = files_source(o, has_table(con, "exif"))
@@ -594,7 +618,13 @@ def search_contents(db_path, root, o, pdftotext, cancel, emit, progress):
         if time.time() - last > 0.3:
             last = time.time()
             progress(f"Searching inside files… {i:,}/{len(cands):,} checked, {found:,} found")
-        text = _read_text(os.path.join(root, rel), ext, pdftotext)
+        if ext in OFFICE_EXTS:
+            try:
+                text = extract_office(os.path.join(root, rel), ext)
+            except Exception:  # damaged / encrypted / not a zip
+                text = ""
+        else:
+            text = _read_text(os.path.join(root, rel), ext, pdftotext)
         if not text:
             continue
         if o.get("regex"):
@@ -679,6 +709,493 @@ def search_names_multi(targets, o):
     key = merge_sort_key(o)
     merged.sort(key=lambda x: key(x[0], x[1]))
     return [r for r, _ in merged[:limit]], total
+
+
+# ---------------------------------------------------------------- content index (full text, SQLite FTS5)
+CONTENT_VERSION = "1"
+# Office Open XML / OpenDocument extensions -> which parts hold the text
+OFFICE_EXTS = {"docx": "docx", "docm": "docx", "xlsx": "xlsx", "xlsm": "xlsx", "pptx": "pptx", "pptm": "pptx",
+               "odt": "odf", "ods": "odf", "odp": "odf"}
+CONTENT_EXTS = TEXT_EXTS | {"pdf"} | set(OFFICE_EXTS)
+CONTENT_MAX_BYTES = {"text": 8 * 1048576, "pdf": 100 * 1048576, "office": 50 * 1048576}
+CONTENT_MAX_CHARS = 2 * 1000 * 1000   # extracted text kept per file
+OFFICE_MAX_XML = 64 * 1048576         # uncompressed XML read per office file (zip bombs)
+PDF_TIMEOUT = 60
+BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+_FTS5 = None
+_TOKEN = re.compile(r"[^\W_]+")       # what the FTS5 unicode61 tokenizer calls a word
+
+
+def fts5_available():
+    """True if this Python's sqlite3 has the FTS5 full-text extension."""
+    global _FTS5
+    if _FTS5 is None:
+        try:
+            con = sqlite3.connect(":memory:")
+            try:
+                con.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+                _FTS5 = True
+            finally:
+                con.close()
+        except sqlite3.Error:
+            _FTS5 = False
+    return _FTS5
+
+
+def content_db_path(root):
+    """The content index lives next to the name index: index_<hash>_content.sqlite."""
+    return db_path_for(root)[:-len(".sqlite")] + "_content.sqlite"
+
+
+def content_kind(ext):
+    return "pdf" if ext == "pdf" else "office" if ext in OFFICE_EXTS else "text"
+
+
+def content_info(cdb):
+    """meta of a usable content index ({} if there is none / it is unreadable)."""
+    if not os.path.isfile(cdb):
+        return {}
+    try:
+        con = sqlite3.connect(cdb, timeout=5)
+        try:
+            if not (has_table(con, "docs") and has_table(con, "fts") and has_table(con, "meta")):
+                return {}
+            return dict(con.execute("SELECT k, v FROM meta"))
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+
+
+def content_ready(cdb):
+    return fts5_available() and content_info(cdb).get("version") == CONTENT_VERSION
+
+
+_XML_BREAK = re.compile(r"</(?:w:p|a:p|text:p|text:h|si|row|table:table-row)>|"
+                        r"<(?:w:br|w:cr|text:line-break|a:br)\b[^>]*/>")
+_XML_SPACE = re.compile(r"</(?:c|table:table-cell)>|<(?:w:tab|text:tab|text:s)\b[^>]*/>")
+_XML_TAG = re.compile(r"<[^>]*>")
+_XLSX_SKIP = re.compile(r'<c\b[^>]*\bt="s"[^>]*>.*?</c>|<f\b[^>]*>.*?</f>|<f\b[^>]*/>', re.S)
+_OFFICE_PARTS = {"docx": r"word/(document|header\d*|footer\d*|footnotes|endnotes|comments)\.xml",
+                 "xlsx": r"xl/(sharedStrings|worksheets/sheet\d+)\.xml",
+                 "pptx": r"ppt/(slides/slide\d+|notesSlides/notesSlide\d+)\.xml",
+                 "odf": r"content\.xml"}
+
+
+def xml_text(data, sheet=False):
+    """Text of an Office XML part: tags removed, paragraphs / rows as line breaks."""
+    s = data.decode("utf-8", "replace")
+    if sheet:  # cells that point into sharedStrings (t="s") and formulas are not text
+        s = _XLSX_SKIP.sub(" ", s)
+    s = _XML_TAG.sub("", _XML_SPACE.sub(" ", _XML_BREAK.sub("\n", s)))
+    return html.unescape(s)
+
+
+def _natural(name):
+    return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", name)]
+
+
+def extract_office(path, ext):
+    """Text of a docx / xlsx / pptx / odt / ods / odp file (read with zipfile)."""
+    kind = OFFICE_EXTS[ext]
+    pat = re.compile(_OFFICE_PARTS[kind])
+    out, read, chars = [], 0, 0
+    with zipfile.ZipFile(path) as z:
+        names = sorted((n for n in z.namelist() if pat.fullmatch(n)), key=_natural)
+        if kind == "docx" and "word/document.xml" in names:  # the body first
+            names.remove("word/document.xml")
+            names.insert(0, "word/document.xml")
+        for n in names:
+            if read >= OFFICE_MAX_XML or chars >= CONTENT_MAX_CHARS:
+                break
+            with z.open(n) as f:
+                data = f.read(OFFICE_MAX_XML - read)
+            read += len(data)
+            t = xml_text(data, sheet=kind == "xlsx" and "/worksheets/" in n)
+            out.append(t)
+            chars += len(t)
+    return "\n".join(out)
+
+
+_RTF_TOKEN = re.compile(r"\\([a-z]{1,32})(-?\d{1,10})?[ ]?|\\'([0-9a-f]{2})|\\([^a-z])|([{}])|[\r\n]+|"
+                        r"([^\\{}\r\n]+)", re.I)
+_RTF_DEST = set("aftncn aftnsep aftnsepc annotation atnauthor atndate atnicn atnid atnparent atnref atntime "
+                "atrfend atrfstart author backgroundcolortbl bkmkend bkmkstart blipuid buptim category colorschememapping "
+                "colortbl comment company creatim datafield datastore defchp defpap do doccomm docvar dptxbxtext "
+                "falt fchars ffdeftext ffentrymcr ffexitmcr ffformat ffhelptext ffl ffname ffstattext field file "
+                "filetbl fldinst fontemb fontfile fonttbl fname footnote formfield generator gridtbl hlinkbase "
+                "info keywords latentstyles levelnumbers leveltext lfolevel linkval list listlevel listname "
+                "listoverride listoverridetable listpicture liststylename listtable listtext lsdlockedexcept "
+                "macc maccPr mailmerge manager mmathPr nonshppict objalias objclass objdata object objname objsect "
+                "objtime oldcprops oldpprops oldsprops oldtprops operator panose password passwordhash pgp "
+                "pgptbl picprop pict pn pnseclvl pntext pntxta pntxtb printim private propname protend protstart "
+                "protusertbl pxe result revtbl revtim rsidtbl rxe shp shpgrp shpinst shppict shprslt shptxt sn "
+                "sp staticval stylesheet subject sv svb tc template themedata title txe ud upr userprops "
+                "wgrffmtfilter windowcaption writereservation writereservhash xe xform xmlattrname xmlattrvalue "
+                "xmlclose xmlname xmlnstbl xmlopen".split())
+_RTF_CHARS = {"par": "\n", "sect": "\n\n", "page": "\n\n", "line": "\n", "tab": "\t", "row": "\n", "cell": " ",
+              "nestcell": " ", "emdash": "\u2014", "endash": "\u2013", "emspace": " ", "enspace": " ",
+              "qmspace": " ", "bullet": "\u2022", "lquote": "\u2018", "rquote": "\u2019",
+              "ldblquote": "\u201c", "rdblquote": "\u201d"}
+
+
+def rtf_to_text(s):
+    """Crude RTF -> plain text: control words dropped, \\'hh and \\uN decoded, hidden groups skipped."""
+    stack, ignorable, ucskip, curskip, out = [], False, 1, 0, []
+    codepage = "cp1254"
+    for m in _RTF_TOKEN.finditer(s):
+        word, arg, hexv, char, brace, text = m.groups()
+        if brace:
+            curskip = 0
+            if brace == "{":
+                stack.append((ucskip, ignorable))
+            elif stack:
+                ucskip, ignorable = stack.pop()
+        elif char:
+            curskip = 0
+            if char == "*":
+                ignorable = True
+            elif not ignorable:
+                if char == "~":
+                    out.append("\xa0")
+                elif char in "{}\\":
+                    out.append(char)
+                elif char == "-":
+                    pass
+        elif word:
+            curskip = 0
+            if word in _RTF_DEST:
+                ignorable = True
+            elif word == "ansicpg" and arg:
+                try:
+                    codecs.lookup("cp" + arg)
+                    codepage = "cp" + arg
+                except LookupError:
+                    pass
+            elif ignorable:
+                pass
+            elif word in _RTF_CHARS:
+                out.append(_RTF_CHARS[word])
+            elif word == "uc" and arg:
+                ucskip = max(0, int(arg))
+            elif word == "u" and arg:
+                c = int(arg)
+                out.append(chr(c + 0x10000 if c < 0 else c) if -0x10000 < c < 0x110000 else "")
+                curskip = ucskip
+        elif hexv:
+            if curskip > 0:
+                curskip -= 1
+            elif not ignorable:
+                out.append(bytes([int(hexv, 16)]).decode(codepage, "replace"))
+        elif text:
+            if curskip > 0:
+                n = min(curskip, len(text))
+                text, curskip = text[n:], curskip - n
+            if text and not ignorable:
+                out.append(text)
+    return "".join(out)
+
+
+def extract_text(full, ext, pdftotext, low_priority=True):
+    """Text of a document for the content index / search (original casing, max
+    CONTENT_MAX_CHARS). Raises OSError, zipfile / subprocess errors… when unreadable."""
+    kind = content_kind(ext)
+    if kind == "pdf":
+        if not pdftotext:
+            raise OSError("pdftotext is not available")
+        r = subprocess.run([pdftotext, "-q", "-enc", "UTF-8", full, "-"], capture_output=True, timeout=PDF_TIMEOUT,
+                           creationflags=CREATE_NO_WINDOW | (BELOW_NORMAL_PRIORITY_CLASS if low_priority else 0))
+        text = r.stdout.decode("utf-8", "replace").replace("\f", "\n")
+    elif kind == "office":
+        text = extract_office(full, ext)
+    else:
+        cap = CONTENT_MAX_BYTES["text"]
+        with open(full, "rb") as f:
+            data = f.read(cap + 1)
+        text = decode_text(data[:cap], truncated=len(data) > cap)
+        if ext == "rtf" and text.lstrip().startswith("{\\rtf"):
+            text = rtf_to_text(text)
+    return text.replace("\x00", "")[:CONTENT_MAX_CHARS]
+
+
+def _content_open(cdb):
+    """Open (and create) a content index: docs = one row per file (status, compressed original
+    text), fts = FTS5 table of the folded text (rowid = docs.id)."""
+    os.makedirs(os.path.dirname(cdb), exist_ok=True)
+    con = sqlite3.connect(cdb, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")  # searches keep reading while the index is written
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.executescript("""CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE IF NOT EXISTS docs(id INTEGER PRIMARY KEY, path TEXT UNIQUE, fmtime REAL, fsize INTEGER,
+                                        status TEXT, chars INTEGER, body BLOB);""")
+    if not has_table(con, "fts"):
+        try:  # contentless (the text is kept compressed in docs.body), rows deletable (SQLite 3.43+)
+            con.execute("CREATE VIRTUAL TABLE fts USING fts5(body, content='', contentless_delete=1, "
+                        "tokenize='unicode61 remove_diacritics 2')")
+        except sqlite3.OperationalError:
+            con.execute("CREATE VIRTUAL TABLE fts USING fts5(body, tokenize='unicode61 remove_diacritics 2')")
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (CONTENT_VERSION,))
+    con.commit()
+    return con
+
+
+def _low_priority_thread():
+    """Background mode for the calling thread (lower CPU and disk priority) on Windows."""
+    if ctypes is None:
+        return
+    try:
+        k = ctypes.windll.kernel32
+        if not k.SetThreadPriority(k.GetCurrentThread(), 0x00010000):  # THREAD_MODE_BACKGROUND_BEGIN
+            k.SetThreadPriority(k.GetCurrentThread(), -2)  # THREAD_PRIORITY_LOWEST
+    except (AttributeError, OSError):
+        pass
+
+
+def content_pass(db_path, cdb_path, root, pdftotext, cancel, progress=None, pause=None, throttle=0.005):
+    """Bring the content index of root up to date with its name index: extract the text of new
+    or changed documents (mtime / size differ), drop files that left the name index.
+    progress(indexed, total) · pause() -> True while the pass should wait (a search runs).
+    Returns (documents, newly_processed, with_text) or None if cancelled."""
+    exts = sorted(CONTENT_EXTS if pdftotext else CONTENT_EXTS - {"pdf"})
+    con = sqlite3.connect(db_path, timeout=10)
+    try:
+        files = con.execute("SELECT rel, ext, size, mtime FROM files WHERE isdir = 0 AND ext IN (%s)"
+                            % ",".join("?" * len(exts)), exts).fetchall()
+    finally:
+        con.close()
+    c = _content_open(cdb_path)
+    try:
+        c.execute("INSERT OR REPLACE INTO meta VALUES ('root', ?)", (os.path.abspath(root),))
+        stored = {p: (i, m, s) for i, p, m, s in c.execute("SELECT id, path, fmtime, fsize FROM docs")}
+        live = {rel: (ext, size, mtime) for rel, ext, size, mtime in files}
+        gone = [(v[0],) for p, v in stored.items() if p not in live]
+        for i in range(0, len(gone), 1000):
+            c.executemany("DELETE FROM fts WHERE rowid = ?", gone[i:i + 1000])
+            c.executemany("DELETE FROM docs WHERE id = ?", gone[i:i + 1000])
+            c.commit()
+        todo = [(rel, ext, size, mtime) for rel, (ext, size, mtime) in live.items()
+                if stored.get(rel) is None or stored[rel][1] != mtime or stored[rel][2] != size]
+        todo.sort(key=lambda x: -(x[3] or 0))  # newest first
+        total, base = len(live), len(live) - len(todo)
+        if progress and todo:
+            progress(base, total)
+        ok, done, last, t_commit = 0, 0, 0.0, time.time()
+        for rel, ext, size, mtime in todo:
+            if cancel.is_set():
+                c.commit()
+                return None
+            while pause is not None and pause() and not cancel.is_set():
+                time.sleep(0.2)
+            kind = content_kind(ext)
+            status, text = "ok", ""
+            if (size or 0) > CONTENT_MAX_BYTES[kind]:
+                status = "big"
+            else:
+                try:
+                    text = extract_text(os.path.join(root, rel), ext, pdftotext)
+                    if not text.strip():
+                        status = "empty"
+                except subprocess.TimeoutExpired:
+                    status = "timeout"
+                except Exception:  # unreadable, locked, encrypted, corrupt…
+                    status = "error"
+            body = zlib.compress(text.encode("utf-8", "replace"), 6) if status == "ok" else None
+            try:
+                old = c.execute("SELECT id FROM docs WHERE path = ?", (rel,)).fetchone()
+                if old:
+                    rid = old[0]
+                    c.execute("DELETE FROM fts WHERE rowid = ?", (rid,))
+                    c.execute("UPDATE docs SET fmtime = ?, fsize = ?, status = ?, chars = ?, body = ? WHERE id = ?",
+                              (mtime, size, status, len(text), body, rid))
+                else:
+                    rid = c.execute("INSERT INTO docs(path, fmtime, fsize, status, chars, body) VALUES (?,?,?,?,?,?)",
+                                    (rel, mtime, size, status, len(text), body)).lastrowid
+                if status == "ok":
+                    c.execute("INSERT INTO fts(rowid, body) VALUES (?, ?)", (rid, fold_fast(text)))
+                    ok += 1
+            except sqlite3.IntegrityError:
+                pass
+            done += 1
+            if time.time() - t_commit > 2:
+                c.commit()
+                t_commit = time.time()
+            if progress and time.time() - last > 0.3:
+                last = time.time()
+                progress(base + done, total)
+            if throttle:
+                time.sleep(throttle)  # leave room for the UI and searches
+        n_ok = c.execute("SELECT COUNT(*) FROM docs WHERE status = 'ok'").fetchone()[0]
+        c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                      [("built", str(time.time())), ("count", str(n_ok)), ("files", str(total))])
+        c.commit()
+        return total, done, ok
+    finally:
+        c.close()
+
+
+def fts_query(q):
+    """Translate a query for the content index. Returns (include, exclude, exts, match) where
+    include / exclude are [(tokens, prefix)] and match is the FTS5 MATCH string, or None when
+    the query needs the live scan (* or ? inside a word)."""
+    include, exclude, exts = parse_query(q)
+
+    def conv(t):
+        prefix = t.endswith("*")
+        core = t.rstrip("*")
+        if "*" in core or "?" in core:
+            raise ValueError
+        toks = _TOKEN.findall(core)
+        return (toks, prefix) if toks else None
+
+    try:
+        inc = [x for x in map(conv, include) if x]
+        exc = [x for x in map(conv, exclude) if x]
+    except ValueError:
+        return None
+
+    def phrase(spec):
+        toks, prefix = spec
+        return '"' + " ".join(toks) + '"' + (" *" if prefix else "")
+
+    match = " AND ".join(map(phrase, inc))
+    if inc and exc:
+        match = f"({match}) NOT ({' OR '.join(map(phrase, exc))})"
+    return inc, exc, exts, match
+
+
+def spec_regex(spec):
+    """Regex for one (tokens, prefix) term on folded text, with FTS5 word semantics."""
+    toks, prefix = spec
+    return re.compile(r"(?<![^\W_])" + r"[\W_]+".join(map(re.escape, toks)) + ("" if prefix else r"(?![^\W_])"))
+
+
+def _snip(text, rx):
+    """Snippet around the first match of rx (on the folded text) in the original text, or None."""
+    ft = fold_fast(text)
+    m = rx.search(ft)
+    if not m:
+        return None
+    src = text if len(ft) == len(text) else ft  # fold_fast keeps offsets for (almost) every text
+    a = max(0, m.start() - 50)
+    return re.sub(r"\s+", " ", src[a:m.end() + 70]).strip()
+
+
+def blob_snippet(blob, rx):
+    """Snippet from a compressed docs.body, decompressing only as far as the first match."""
+    if not blob:
+        return ""
+    d = zlib.decompressobj()
+    dec = codecs.getincrementaldecoder("utf-8")("replace")
+    buf, head, step = "", None, 256 * 1024
+    try:
+        for i in range(0, len(blob), step):
+            text = dec.decode(d.decompress(blob[i:i + step]), final=i + step >= len(blob))
+            if head is None and text:
+                head = text[:120]
+            buf += text
+            s = _snip(buf, rx)
+            if s is not None:
+                return s
+            buf = buf[-400:]
+    except zlib.error:
+        pass
+    return re.sub(r"\s+", " ", head or "").strip()
+
+
+def search_contents_indexed(db_path, cdb_path, root, o, pdftotext, cancel, emit, progress, replace=None):
+    """'File contents' search with the content index (FTS5 MATCH on the folded text) plus a live
+    scan of the candidates that are not (yet / no longer) in the content index.
+    Returns None when the index cannot answer this query (regex, wildcards, no index) - the
+    caller then uses search_contents(). Otherwise (shown, total, live_checked, note).
+    Rows go to emit(rows) in batches; when live matches had to be merged in, replace(rows)
+    gets the final sorted list (if replace is None the live rows are emitted too)."""
+    if o.get("regex") or not content_ready(cdb_path):
+        return None
+    spec = fts_query(o.get("query", ""))
+    if spec is None:
+        return None
+    inc, exc, exts, match = spec
+    if not inc:
+        return 0, 0, 0, "Type at least one word to look for inside files."
+    limit = int(o.get("limit") or 2000)
+    order = SORTS.get(o.get("sort") or "Best match") or "mtime DESC"
+    rx = spec_regex(inc[0])
+    con = _connect(db_path)
+    try:
+        con.execute("ATTACH DATABASE ? AS c", (cdb_path,))
+        src = files_source(o, has_table(con, "exif"), file_mtime=True)
+        where, params = filter_clauses(o, exts, restrict_exts=CONTENT_EXTS)
+        where.append("isdir = 0")
+        w = " AND ".join(where)
+        cur_doc = "d.path = f.rel AND d.fmtime = f.file_mtime AND d.fsize = f.size"
+        fts_ids = "d.id IN (SELECT rowid FROM c.fts WHERE fts MATCH ?)"
+        rows = con.execute(f"SELECT f.rel, f.name, f.ext, f.size, f.mtime, d.id FROM {src} AS f JOIN c.docs d "
+                           f"ON {cur_doc} WHERE {w} AND {fts_ids} ORDER BY {order}, length(f.rel) LIMIT ?",
+                           params + [match, limit]).fetchall()
+        total = len(rows)
+        if total >= limit:
+            total = con.execute(f"SELECT COUNT(*) FROM {src} AS f JOIN c.docs d ON {cur_doc} WHERE {w} AND {fts_ids}",
+                                params + [match]).fetchone()[0]
+        # documents the content index cannot answer for: new / changed since indexed (PDFs only
+        # with 'Include PDF text'); unreadable / too big ones are in docs and are skipped here
+        kinds = ["(ext = 'pdf' AND size <= ?)" if pdftotext and o.get("pdf") else None,
+                 "(ext IN (%s) AND size <= ?)" % ",".join("?" * len(OFFICE_EXTS)),
+                 "(ext NOT IN ('pdf', %s) AND size <= ?)" % ",".join("?" * len(OFFICE_EXTS))]
+        kp = ([CONTENT_MAX_BYTES["pdf"]] if kinds[0] else []) + sorted(OFFICE_EXTS) + [CONTENT_MAX_BYTES["office"]] \
+            + sorted(OFFICE_EXTS) + [CONTENT_MAX_BYTES["text"]]
+        ksql = "(" + " OR ".join(k for k in kinds if k) + ")"
+        cands = con.execute(f"SELECT f.rel, f.name, f.ext, f.size, f.mtime FROM {src} AS f LEFT JOIN c.docs d "
+                            f"ON {cur_doc} WHERE {w} AND d.id IS NULL AND {ksql} ORDER BY mtime DESC LIMIT ?",
+                            params + kp + [MAX_CONTENT_CANDIDATES]).fetchall()
+        batch, done_rows, last = [], [], 0.0
+        for i, (rel, name, ext, size, mtime, rid) in enumerate(rows, 1):
+            if cancel.is_set():
+                break
+            blob = con.execute("SELECT body FROM c.docs WHERE id = ?", (rid,)).fetchone()
+            batch.append((rel, name, ext, size, mtime, 0, blob_snippet(blob[0] if blob else None, rx)))
+            done_rows.append(batch[-1])
+            if len(batch) >= 50:
+                emit(batch)
+                batch = []
+            if time.time() - last > 0.3:
+                last = time.time()
+                progress(f"Content index: {i:,}/{len(rows):,} matching files…")
+        if batch:
+            emit(batch)
+    finally:
+        con.close()
+    found, checked, last = [], 0, 0.0
+    if cands and not cancel.is_set():
+        inc_rx = [spec_regex(x) for x in inc]
+        exc_rx = [spec_regex(x) for x in exc]
+        for i, (rel, name, ext, size, mtime) in enumerate(cands, 1):
+            if cancel.is_set() or len(found) >= limit:
+                break
+            if time.time() - last > 0.3:
+                last = time.time()
+                progress(f"Indexed: {len(rows):,} found · checking files not indexed yet… {i:,}/{len(cands):,}, "
+                         f"{len(found):,} found")
+            checked += 1
+            try:
+                text = extract_text(os.path.join(root, rel), ext, pdftotext, low_priority=False)
+            except Exception:
+                continue
+            ft = fold(text)
+            if any(not r.search(ft) for r in inc_rx) or any(r.search(ft) for r in exc_rx):
+                continue
+            found.append((rel, name, ext, size, mtime, 0,
+                          _snip(text, rx) or re.sub(r"\s+", " ", text[:120]).strip()))
+    if found:
+        total += len(found)
+        if replace is None:
+            emit(found)
+        else:  # final list: indexed + live matches in the chosen order, Max results applied
+            key = merge_sort_key(o)
+            merged = sorted(done_rows + found, key=lambda r: key(r, len(r[0])))[:limit]
+            replace(merged)
+    note = " (candidate list capped)" if len(cands) >= MAX_CONTENT_CANDIDATES else ""
+    shown = len(done_rows) + len(found) if replace is None else min(limit, len(done_rows) + len(found))
+    return shown, total, checked, note
 
 
 # ---------------------------------------------------------------- duplicates
@@ -1153,6 +1670,380 @@ def exif_put(db_path, rel, dates):
         con.close()
 
 
+# ---------------------------------------------------------------- live updates (ReadDirectoryChangesW)
+FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_MODIFIED = 1, 2, 3
+FILE_ACTION_RENAMED_OLD_NAME, FILE_ACTION_RENAMED_NEW_NAME = 4, 5
+LIVE_NOTIFY_FILTER = 0x01 | 0x02 | 0x08 | 0x10  # FILE_NAME | DIR_NAME | SIZE | LAST_WRITE
+LIVE_BUFFER = 64 * 1024        # 64 KB is the maximum for network drives
+LIVE_QUIET = 1.0               # apply a batch after this many seconds without new events…
+LIVE_MAX_WAIT = 3.0            # …or at the latest this long after its first event
+LIVE_HOLD_MAX = 200000         # events kept while a root's index is being rebuilt
+LIVE_OVERFLOW = "overflow"
+ERROR_OPERATION_ABORTED = 995
+ERROR_NOTIFY_ENUM_DIR = 1022
+_K32 = None
+
+
+def _kernel32():
+    """kernel32 with the prototypes the directory watcher needs (own instance, last-error kept)."""
+    global _K32
+    if _K32 is None:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                  wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.ReadDirectoryChangesW.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, wintypes.BOOL,
+                                            wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+                                            wintypes.LPVOID]
+        k.ReadDirectoryChangesW.restype = wintypes.BOOL
+        k.CancelIoEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+        k.CancelIoEx.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.restype = wintypes.BOOL
+        _K32 = k
+    return _K32
+
+
+def parse_notify(buf, n):
+    """[(action, relative name)] from a FILE_NOTIFY_INFORMATION buffer of n bytes."""
+    out, off = [], 0
+    base = ctypes.addressof(buf)
+    while off + 12 <= n:
+        nxt, action, ln = struct.unpack_from("<III", buf, off)
+        out.append((action, ctypes.string_at(base + off + 12, ln).decode("utf-16-le", "replace")))
+        if not nxt:
+            break
+        off += nxt
+    return out
+
+
+class DirWatcher(threading.Thread):
+    """Watches one folder tree with a blocking ReadDirectoryChangesW in its own thread.
+    sink(root, events | LIVE_OVERFLOW) receives the changes; state(root, ok, message) reports
+    whether watching works. stop() cancels the pending call (CancelIoEx)."""
+
+    def __init__(self, root, sink, state):
+        super().__init__(daemon=True, name="QuickSearch watcher " + root)
+        self.root, self.sink, self.state = root, sink, state
+        self.handle = None
+        self.stopping = False
+
+    def run(self):
+        try:
+            k = _kernel32()
+        except (AttributeError, OSError) as ex:
+            self.state(self.root, False, f"not supported ({ex})")
+            return
+        h = k.CreateFileW(self.root, 0x0001, 0x07, None, 3, 0x02000000, None)  # LIST_DIRECTORY, share all,
+        if not h or h == wintypes.HANDLE(-1).value:                              # OPEN_EXISTING, BACKUP_SEMANTICS
+            self.state(self.root, False, f"cannot open the folder (error {ctypes.get_last_error()})")
+            return
+        self.handle = h
+        buf = ctypes.create_string_buffer(LIVE_BUFFER)
+        got = wintypes.DWORD()
+        try:
+            while not self.stopping:
+                ok = k.ReadDirectoryChangesW(h, buf, LIVE_BUFFER, True, LIVE_NOTIFY_FILTER, ctypes.byref(got),
+                                             None, None)
+                if self.stopping:
+                    break
+                if not ok:
+                    err = ctypes.get_last_error()
+                    if err == ERROR_NOTIFY_ENUM_DIR:  # too many changes: the buffer overflowed
+                        self.sink(self.root, LIVE_OVERFLOW)
+                        continue
+                    self.state(self.root, False, "watching failed (error %d)" % err)
+                    return
+                if got.value == 0:  # overflow as well
+                    self.sink(self.root, LIVE_OVERFLOW)
+                    continue
+                self.sink(self.root, parse_notify(buf, got.value))
+        finally:
+            self.handle = None
+            k.CloseHandle(h)
+
+    def stop(self, wait=2.0):
+        self.stopping = True
+        k = _K32
+        end = time.time() + wait
+        while self.is_alive() and time.time() < end:
+            h = self.handle
+            if h and k is not None:
+                k.CancelIoEx(h, None)  # makes the blocking ReadDirectoryChangesW return
+            self.join(0.05)
+
+
+def _live_ignored(rel, system, skip):
+    """True for paths a live update must not touch: the app's own data folder and (unless the
+    index includes system folders) SKIP_DIRS / SKIP_FILES."""
+    if skip:
+        k = os.path.normcase(rel)
+        if k == skip or k.startswith(skip + os.sep):
+            return True
+    if system:
+        return False
+    parts = rel.lower().split("\\")
+    return any(p in SKIP_DIRS for p in parts) or parts[-1] in SKIP_FILES
+
+
+def _live_delete(con, rel):
+    """Delete rel and everything below it (case-insensitive, via the files_rel index)."""
+    n = con.execute("DELETE FROM files WHERE rel = ? COLLATE NOCASE", (rel,)).rowcount
+    n += con.execute("DELETE FROM files WHERE rel >= ? COLLATE NOCASE AND rel < ? COLLATE NOCASE",
+                     (rel + "\\", rel + "]")).rowcount  # ']' sorts right after '\'
+    return n
+
+
+def _live_sync(con, root, rel, system, walked, fresh):
+    """Make the index rows of rel match the disk. A new (fresh) or unknown folder is walked
+    completely; for a known folder only its own row is updated. Returns the row-count delta."""
+    full = os.path.join(root, rel)
+    try:
+        st = os.stat(full, follow_symlinks=False)
+    except OSError:
+        return -_live_delete(con, rel)
+    name = os.path.basename(rel)
+    if stat.S_ISDIR(st.st_mode):
+        have = con.execute("SELECT isdir FROM files WHERE rel = ? COLLATE NOCASE", (rel,)).fetchone()
+        if fresh or not have or not have[0]:
+            n = -_live_delete(con, rel)
+            rows = [_index_row(rel, name, True, 0, st.st_mtime)]
+            for path, nm, d, size, mtime in _walk(full, system):
+                rows.append(_index_row(rel + path[len(full):], nm, d, size, mtime))
+            con.executemany("INSERT INTO files VALUES (?,?,?,?,?,?,?,?)", rows)
+            walked.append(os.path.normcase(full) + os.sep)
+            return n + len(rows)
+        con.execute("UPDATE files SET rel = ?, name = ?, fname = ?, fpath = ?, mtime = ? WHERE rel = ? COLLATE NOCASE",
+                    (rel, name, fold(name), fold(rel), st.st_mtime, rel))
+        return 0
+    n = -_live_delete(con, rel)
+    con.execute("INSERT INTO files VALUES (?,?,?,?,?,?,?,?)", _index_row(rel, name, False, st.st_size, st.st_mtime))
+    return n + 1
+
+
+def _live_rename(con, old, new, cdb):
+    """Move the index rows of old (and below it) to new, keeping photo dates and extracted text.
+    Returns (row delta, renamed?)."""
+    row = con.execute("SELECT isdir FROM files WHERE rel = ? COLLATE NOCASE", (old,)).fetchone()
+    if not row:
+        return 0, False
+    n = 0
+    if os.path.normcase(old) != os.path.normcase(new):
+        n -= _live_delete(con, new)
+    isdir = row[0]
+    name = os.path.basename(new)
+    ext = "" if isdir else os.path.splitext(name)[1][1:].lower()
+    con.execute("UPDATE files SET rel = ?, name = ?, ext = ?, fname = ?, fpath = ? WHERE rel = ? COLLATE NOCASE",
+                (new, name, ext, fold(name), fold(new), old))
+    if isdir:
+        con.execute("UPDATE files SET rel = ? || substr(rel, ?), fpath = FOLD(? || substr(rel, ?)) "
+                    "WHERE rel >= ? COLLATE NOCASE AND rel < ? COLLATE NOCASE",
+                    (new, len(old) + 1, new, len(old) + 1, old + "\\", old + "]"))
+    move = ("SET {c} = ? || substr({c}, ?) WHERE {c} = ? OR ({c} >= ? AND {c} < ?)",
+            (new, len(old) + 1, old, old + "\\", old + "]"))
+    if has_table(con, "exif"):
+        con.execute("UPDATE OR REPLACE exif " + move[0].format(c="rel"), move[1])
+    if cdb and os.path.isfile(cdb):
+        try:
+            c = sqlite3.connect(cdb, timeout=10)
+            try:
+                if has_table(c, "docs"):
+                    c.execute("UPDATE OR IGNORE docs " + move[0].format(c="path"), move[1])
+                    c.commit()
+            finally:
+                c.close()
+        except sqlite3.Error:
+            pass  # the next content pass re-reads them
+    return n, True
+
+
+def live_apply(root, db_path, events, cdb=None):
+    """Apply [(action, relative name)] change notifications to the name index of root
+    (incrementally, checking the disk for the current state). Returns {"changed": number of
+    paths that changed, "dirty": True if documents / photos / folders were touched (the
+    content index and photo dates should be updated)}."""
+    con = sqlite3.connect(db_path, timeout=10)
+    try:
+        con.create_function("FOLD", 1, fold, deterministic=True)
+        con.execute(FILES_REL_INDEX_SQL)  # (older indexes: created once)
+        meta = dict(con.execute("SELECT k, v FROM meta"))
+        system = meta.get("system") == "1"
+        skip = os.path.normcase(rel_to(DATA_DIR, root)) if path_in(DATA_DIR, root) else None
+        if skip == "":
+            skip = None
+        walked, delta, changed, dirty = [], 0, 0, False
+        relevant = CONTENT_EXTS | set(EXIF_EXTS)
+
+        def note(rel):
+            nonlocal changed, dirty
+            changed += 1
+            e = os.path.splitext(rel)[1][1:].lower()
+            if not e or e in relevant or not os.path.isfile(os.path.join(root, rel)):
+                dirty = True
+
+        i = 0
+        while i < len(events):
+            action, rel = events[i]
+            i += 1
+            rel = rel.strip("\\/").replace("/", "\\")
+            if not rel:
+                continue
+            if action == FILE_ACTION_RENAMED_OLD_NAME:
+                new = None
+                if i < len(events) and events[i][0] == FILE_ACTION_RENAMED_NEW_NAME:
+                    new = events[i][1].strip("\\/").replace("/", "\\")
+                    i += 1
+                old_ign = _live_ignored(rel, system, skip)
+                new_ign = new is None or _live_ignored(new, system, skip)
+                if not old_ign and not new_ign:
+                    d, moved = _live_rename(con, rel, new, cdb)
+                    delta += d + _live_sync(con, root, new, system, walked, fresh=not moved)
+                    note(rel)
+                    note(new)
+                elif not old_ign:  # e.g. moved into $RECYCLE.BIN
+                    delta += _live_sync(con, root, rel, system, walked, fresh=False)
+                    note(rel)
+                elif not new_ign:  # e.g. restored from the Recycle Bin
+                    delta += _live_sync(con, root, new, system, walked, fresh=True)
+                    note(new)
+                continue
+            if action == FILE_ACTION_RENAMED_NEW_NAME:  # without its old name: treat as new
+                action = FILE_ACTION_ADDED
+            if _live_ignored(rel, system, skip):
+                continue
+            if action != FILE_ACTION_REMOVED and walked:
+                k = os.path.normcase(os.path.join(root, rel))
+                if k.startswith(tuple(walked)) and os.path.lexists(k):
+                    continue  # already read by the walk of a new folder in this batch
+            delta += _live_sync(con, root, rel, system, walked, fresh=action == FILE_ACTION_ADDED)
+            note(rel)
+        _adjust_count(con, delta)
+        con.commit()
+        return {"changed": changed, "dirty": dirty}
+    finally:
+        con.close()
+
+
+class LiveIndexer:
+    """Keeps the name indexes of the watched roots up to date while the program runs.
+
+    One DirWatcher thread per root feeds a queue; a worker thread batches the events (quiet
+    period LIVE_QUIET, at most LIVE_MAX_WAIT) and applies them with live_apply. post(msg) sends
+    to the app queue: ("live", root, changed, dirty, error), ("lstate", root, ok, text),
+    ("loverflow", root). While a root's index is rebuilt (hold) its events are kept and
+    replayed afterwards (release)."""
+
+    def __init__(self, post, quiet=LIVE_QUIET, max_wait=LIVE_MAX_WAIT):
+        self.post, self.quiet, self.max_wait = post, quiet, max_wait
+        self.watchers = {}
+        self.events = queue.Queue()
+        self.lock = threading.Lock()
+        self.held = {}
+        self.quit = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="QuickSearch live index")
+        self.thread.start()
+
+    def roots(self):
+        return [w.root for w in self.watchers.values()]
+
+    def set_roots(self, roots):
+        """Watch exactly these roots (stopped watchers of removed roots; failed ones are retried)."""
+        want = {}
+        for r in roots:
+            a = os.path.abspath(r)
+            want[os.path.normcase(a)] = a
+        for k in list(self.watchers):
+            if k not in want:
+                self.watchers.pop(k).stop()
+        for k, r in want.items():
+            w = self.watchers.get(k)
+            if w is not None and w.is_alive():
+                continue
+            w = DirWatcher(r, self._sink, self._state)
+            self.watchers[k] = w
+            w.start()
+            self.post(("lstate", r, True, "watching"))
+
+    def _sink(self, root, payload):
+        self.events.put((root, payload))
+
+    def _state(self, root, ok, text):
+        self.post(("lstate", root, ok, text))
+
+    def hold(self, root):
+        with self.lock:
+            self.held.setdefault(os.path.normcase(os.path.abspath(root)), [])
+
+    def release(self, root):
+        k = os.path.normcase(os.path.abspath(root))
+        with self.lock:
+            evs = self.held.pop(k, None)
+        if evs:
+            self.events.put((os.path.abspath(root), evs))
+
+    def stop(self):
+        self.quit.set()
+        for w in list(self.watchers.values()):
+            w.stopping = True
+        for w in list(self.watchers.values()):
+            w.stop()
+        self.watchers.clear()
+        self.thread.join(2)
+
+    def _run(self):
+        pending, first, last = {}, 0.0, 0.0
+        while not self.quit.is_set():
+            try:
+                root, payload = self.events.get(timeout=0.2)
+            except queue.Empty:
+                root = None
+            now = time.time()
+            if root is not None:
+                k = os.path.normcase(os.path.abspath(root))
+                if payload == LIVE_OVERFLOW:
+                    pending.pop(k, None)
+                    with self.lock:
+                        if k in self.held:
+                            self.held[k] = []
+                            continue  # the running rebuild reads the folder anyway
+                    self.post(("loverflow", root))
+                    continue
+                with self.lock:
+                    if k in self.held:
+                        if len(self.held[k]) < LIVE_HOLD_MAX:
+                            self.held[k].extend(payload)
+                        continue
+                pending.setdefault(k, (root, []))[1].extend(payload)
+                first = first or now
+                last = now
+            if pending and (now - last >= self.quiet or now - first >= self.max_wait):
+                batch, pending, first = pending, {}, 0.0
+                for k, (r, evs) in batch.items():
+                    with self.lock:
+                        if k in self.held:
+                            self.held[k].extend(evs)
+                            continue
+                    self._apply(r, evs)
+
+    def _apply(self, root, evs):
+        db = db_path_for(root)
+        if index_info(db) is None:
+            return
+        err = None
+        for attempt in range(5):
+            try:
+                res = live_apply(root, db, evs, content_db_path(root))
+                self.post(("live", root, res["changed"], res["dirty"], None))
+                return
+            except sqlite3.OperationalError as ex:  # locked by a long write - try again shortly
+                err = str(ex)
+                time.sleep(0.5 * (attempt + 1))
+            except Exception as ex:
+                err = str(ex)
+                break
+        self.post(("live", root, 0, False, err))
+
+
 # ---------------------------------------------------------------- disk space
 def space_scan(targets, o, top_n, cancel, progress):
     """Disk usage from the index within the search filters (Type, Look in, size, date).
@@ -1388,6 +2279,145 @@ def transfer_item(src, dst, op, overwrite=False):
         except OSError as ex:
             note = (note + "; " if note else "") + f"the replaced item is kept as {backup} ({ex})"
     return note
+
+
+# ---------------------------------------------------------------- Explorer right-click menu + command line
+SHELL_CLASSES_KEY = r"Software\Classes"   # under HKEY_CURRENT_USER (per user, no admin rights)
+SHELL_VERB = "QuickSearch"
+SHELL_LABEL = "QuickSearch here"
+# (class, placeholder): %1 = the clicked folder / drive, %V = the folder whose background was clicked
+SHELL_TARGETS = (("Directory", "%1"), ("Directory\\Background", "%V"), ("Drive", "%1"))
+
+
+def gui_python():
+    """pythonw.exe next to the running interpreter (no console window), else the interpreter."""
+    exe = sys.executable or "pythonw.exe"
+    pw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    return pw if os.path.isfile(pw) else exe
+
+
+def script_path():
+    return os.path.abspath(globals().get("__file__") or sys.argv[0])
+
+
+def explorer_command(placeholder):
+    return f'"{gui_python()}" "{script_path()}" --scope "{placeholder}"'
+
+
+def explorer_menu_keys():
+    """Registry keys (below HKEY_CURRENT_USER) of the right-click entry."""
+    return [f"{SHELL_CLASSES_KEY}\\{cls}\\shell\\{SHELL_VERB}" for cls, _ in SHELL_TARGETS]
+
+
+def explorer_menu_install():
+    """Write the 'QuickSearch here' entries. Returns the keys written."""
+    import winreg
+    written = []
+    for (cls, ph), key in zip(SHELL_TARGETS, explorer_menu_keys()):
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_WRITE) as k:
+            winreg.SetValueEx(k, None, 0, winreg.REG_SZ, SHELL_LABEL)
+            winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, gui_python())
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key + "\\command", 0, winreg.KEY_WRITE) as k:
+            winreg.SetValueEx(k, None, 0, winreg.REG_SZ, explorer_command(ph))
+        written.append(key)
+    return written
+
+
+def explorer_menu_remove():
+    """Delete the entries written by explorer_menu_install. Returns the keys removed."""
+    import winreg
+    removed = []
+    for key in explorer_menu_keys():
+        for sub in (key + "\\command", key):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+                if sub == key:
+                    removed.append(key)
+            except FileNotFoundError:
+                pass
+    return removed
+
+
+def explorer_menu_installed():
+    """The command line registered for folders, or None when the entry is not installed."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, explorer_menu_keys()[0] + "\\command") as k:
+            return winreg.QueryValueEx(k, None)[0]
+    except (ImportError, OSError):
+        return None
+
+
+def clean_scope_arg(s):
+    """Folder from --scope. Explorer passes a drive as "F:\\" which the command-line parser turns
+    into F:" (backslash-quote) - repair that."""
+    s = (s or "").strip().strip('"').strip()
+    if re.fullmatch(r"[A-Za-z]:", s):
+        s += "\\"
+    return s
+
+
+def parse_cli(argv):
+    """Options from the command line: {'scope': folder or None}."""
+    scope, i = None, 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--scope" and i + 1 < len(argv):
+            scope = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--scope="):
+            scope = a[len("--scope="):]
+        i += 1
+    return {"scope": clean_scope_arg(scope) if scope else None}
+
+
+def drive_root(path):
+    r"""'F:\' for a path on drive F: ('\\server\share\' for a UNC path)."""
+    d = os.path.splitdrive(os.path.abspath(path))[0]
+    return d.rstrip("\\/") + "\\" if d else os.path.abspath(path)
+
+
+def ask_scope_root(parent, folder, drive):
+    """Ask what to index for a --scope folder that is in no root: 'drive', 'folder' or None."""
+    win = tk.Toplevel(parent)
+    win.title(APP + " - new folder")
+    win.resizable(False, False)
+    win.transient(parent)
+    res = [None]
+    body = ttk.Frame(win, padding=12)
+    body.pack(fill="both", expand=True)
+    ttk.Label(body, text=f"{folder}\n\nis not inside any indexed root.", font=("Segoe UI", 9, "bold"),
+              wraplength=520, justify="left").pack(anchor="w")
+    ttk.Label(body, wraplength=520, justify="left", text=(
+        f"Add the whole drive {drive} as a new root (every folder on it becomes searchable; indexing a big "
+        "drive takes a little while), or only this folder? Look in is set to the folder either way.")
+              ).pack(anchor="w", pady=(6, 10))
+    btns = ttk.Frame(body)
+    btns.pack(fill="x")
+
+    def done(v):
+        res[0] = v
+        win.destroy()
+
+    b = ttk.Button(btns, text=f"Add drive {drive}", command=lambda: done("drive"))
+    b.pack(side="left")
+    ttk.Button(btns, text="Add only this folder", command=lambda: done("folder")).pack(side="left", padx=6)
+    ttk.Button(btns, text="Cancel", command=lambda: done(None)).pack(side="right")
+    win.bind("<Escape>", lambda e: done(None))
+    win.protocol("WM_DELETE_WINDOW", lambda: done(None))
+    win.update_idletasks()
+    try:
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - win.winfo_width()) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - win.winfo_height()) // 3)
+        win.geometry(f"+{x}+{y}")
+    except tk.TclError:
+        pass
+    b.focus_set()
+    win.grab_set()
+    win.wait_window()
+    return res[0]
+
 
 
 # ---------------------------------------------------------------- GUI
@@ -2481,10 +3511,173 @@ class SpaceWindow(tk.Toplevel):
         self.destroy()
 
 
+class SettingsDialog(tk.Toplevel):
+    """Content index and live-update switches, Explorer right-click menu (only on request)."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title(APP + " - settings")
+        self.resizable(True, False)
+        self.minsize(560, 0)
+        self.transient(app)
+        pad = {"padx": 8, "pady": (8, 0)}
+        wrap = 600
+
+        f1 = ttk.LabelFrame(self, text="Content index (fast 'File contents' search)", padding=8)
+        f1.pack(fill="x", **pad)
+        self.c_content = ttk.Checkbutton(f1, text="Content index: On", variable=app.v_content_on,
+                                         command=self._content_toggled)
+        self.c_content.pack(anchor="w")
+        ttk.Label(f1, wraplength=wrap, justify="left", foreground="#444", text=(
+            "Keeps a full-text index of text/code files, PDFs, Word / Excel / PowerPoint (docx, xlsx, pptx), "
+            "OpenDocument (odt, ods, odp) and RTF next to the name index. It is built in the background after "
+            "indexing (only new / changed documents, low priority); searches use it at once and scan the "
+            "documents that are not indexed yet live.")).pack(anchor="w", pady=(2, 4))
+        self.v_cinfo = tk.StringVar()
+        ttk.Label(f1, textvariable=self.v_cinfo, wraplength=wrap, justify="left").pack(anchor="w")
+        b1 = ttk.Frame(f1)
+        b1.pack(fill="x", pady=(6, 0))
+        self.b_cnow = ttk.Button(b1, text="Update content index now", command=self._content_now)
+        self.b_cnow.pack(side="left")
+        if not fts5_available():
+            self.c_content.configure(state="disabled", text="Content index: not available")
+            self.b_cnow.configure(state="disabled")
+
+        f2 = ttk.LabelFrame(self, text="Live updates", padding=8)
+        f2.pack(fill="x", **pad)
+        self.c_live = ttk.Checkbutton(f2, text="Live updates: On", variable=app.v_live_on,
+                                      command=self._live_toggled)
+        self.c_live.pack(anchor="w")
+        ttk.Label(f2, wraplength=wrap, justify="left", foreground="#444", text=(
+            "While QuickSearch runs, the searched roots (the current root, or all roots with 'Search all "
+            "roots') are watched: new, changed, renamed and deleted files and folders reach the index within "
+            "a few seconds. Drives that cannot be watched (some network / removable drives) are kept fresh by "
+            "Auto-refresh.")).pack(anchor="w", pady=(2, 4))
+        self.v_linfo = tk.StringVar()
+        ttk.Label(f2, textvariable=self.v_linfo, wraplength=wrap, justify="left").pack(anchor="w")
+
+        f3 = ttk.LabelFrame(self, text="Explorer right-click menu", padding=8)
+        f3.pack(fill="x", **pad)
+        ttk.Label(f3, wraplength=wrap, justify="left", foreground="#444", text=(
+            "Adds 'QuickSearch here' to the right-click menu of folders, folder backgrounds and drives in "
+            "Explorer (for your user account only: HKEY_CURRENT_USER\\Software\\Classes). It opens QuickSearch "
+            "with Look in set to that folder. Nothing is changed until you click a button.")
+                  ).pack(anchor="w", pady=(0, 4))
+        self.v_einfo = tk.StringVar()
+        ttk.Label(f3, textvariable=self.v_einfo, wraplength=wrap, justify="left").pack(anchor="w")
+        b3 = ttk.Frame(f3)
+        b3.pack(fill="x", pady=(6, 0))
+        self.b_add = ttk.Button(b3, text="Add 'QuickSearch here' to Explorer right-click menu…",
+                                command=self.add_menu)
+        self.b_add.pack(side="left")
+        self.b_remove = ttk.Button(b3, text="Remove it…", command=self.remove_menu)
+        self.b_remove.pack(side="left", padx=6)
+
+        bot = ttk.Frame(self, padding=8)
+        bot.pack(fill="x")
+        ttk.Button(bot, text="Close", command=self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.refresh()
+        self.update_idletasks()
+        try:
+            x = app.winfo_rootx() + max(0, (app.winfo_width() - self.winfo_width()) // 2)
+            y = app.winfo_rooty() + 60
+            self.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+
+    def refresh(self):
+        if not self.winfo_exists():
+            return
+        app = self.app
+        if not fts5_available():
+            self.v_cinfo.set(f"SQLite FTS5 is not available in this Python (SQLite {sqlite3.sqlite_version}) - "
+                             "'File contents' search scans the files live.")
+        else:
+            lines = []
+            for r in (app._all_roots() if app.v_allroots.get() else [app.root_dir]):
+                ci = content_info(content_db_path(r))
+                if app.content_running and os.path.normcase(app.content_root or "") == os.path.normcase(r):
+                    lines.append(f"{r}: being updated…")
+                elif ci.get("count"):
+                    try:
+                        mb = os.path.getsize(content_db_path(r)) / 1048576
+                    except OSError:
+                        mb = 0
+                    lines.append(f"{r}: {int(ci['count']):,} documents with text ({mb:,.1f} MB), updated "
+                                 f"{app.fmt_time(float(ci.get('built', 0)))}")
+                else:
+                    lines.append(f"{r}: no content index yet")
+            self.v_cinfo.set("\n".join(lines))
+        if app.live is None:
+            self.v_linfo.set("Not available on this system.")
+        elif not app.v_live_on.get():
+            self.v_linfo.set("Off - Auto-refresh keeps the index fresh.")
+        else:
+            st = list(app.live_state.values())
+            self.v_linfo.set("\n".join(f"{r}: {'watched' if ok else 'not watched - ' + t}" for r, ok, t in st)
+                             or "No indexed root to watch yet.")
+        if fts5_available():
+            self.c_content.configure(text="Content index: " + ("On" if app.v_content_on.get() else "Off"))
+        self.c_live.configure(text="Live updates: " + ("On" if app.v_live_on.get() else "Off"))
+        cmd = explorer_menu_installed()
+        self.v_einfo.set(f"Installed: {cmd}" if cmd else "Not installed.")
+        self.b_remove.configure(state="normal" if cmd else "disabled")
+
+    def _content_toggled(self):
+        self.app._content_toggled()
+        self.refresh()
+
+    def _content_now(self):
+        if not self.app.v_content_on.get():
+            self.app.v_content_on.set(True)
+            self.app._save_settings()
+        self.app._content_schedule()
+        self.after(300, self.refresh)
+
+    def _live_toggled(self):
+        self.app._live_toggled()
+        self.refresh()
+        self.after(300, self.refresh)
+
+    def add_menu(self):
+        keys = explorer_menu_keys()
+        msg = ("Add 'QuickSearch here' to the Explorer right-click menu?\n\nThese registry keys are written "
+               "(current user only):\n\n" + "\n".join("HKEY_CURRENT_USER\\" + k for k in keys)
+               + "\n\nCommand:\n" + explorer_command("%1")
+               + "\n\n'Remove it' deletes them again.")
+        if not messagebox.askyesno(APP + " - Explorer menu", msg, parent=self):
+            return
+        try:
+            written = explorer_menu_install()
+        except OSError as ex:
+            messagebox.showerror(APP, f"Could not write the registry keys:\n{ex}", parent=self)
+        else:
+            messagebox.showinfo(APP, f"Done: {len(written)} entries added. Right-click a folder, a folder "
+                                     "background or a drive in Explorer and choose 'QuickSearch here'.\n\n"
+                                "(On Windows 11 it is under 'Show more options'.)", parent=self)
+        self.refresh()
+
+    def remove_menu(self):
+        if not messagebox.askyesno(APP + " - Explorer menu", "Remove 'QuickSearch here' from the Explorer "
+                                   "right-click menu?\n\n" + "\n".join("HKEY_CURRENT_USER\\" + k
+                                                                          for k in explorer_menu_keys()),
+                                   parent=self):
+            return
+        try:
+            removed = explorer_menu_remove()
+        except OSError as ex:
+            messagebox.showerror(APP, f"Could not remove the registry keys:\n{ex}", parent=self)
+        else:
+            messagebox.showinfo(APP, f"Removed ({len(removed)} entries).", parent=self)
+        self.refresh()
+
+
 class App(tk.Tk):
     COLS = ("name", "folder", "size", "modified", "type", "snippet")
 
-    def __init__(self):
+    def __init__(self, scope=None):
         super().__init__()
         self.title(APP)
         self.geometry("1250x780")
@@ -2539,6 +3732,24 @@ class App(tk.Tk):
         self.rows_taken = False           # the shown rows carry the EXIF date in the date column
         # file operations
         self.fileop_running = False
+        # content index (full text) built in the background
+        self.v_content_on = tk.BooleanVar(value=bool(self.settings.get("content_index", True)))
+        self.content_running = False
+        self.content_root = None
+        self.content_cancel = threading.Event()
+        self.content_queue = []
+        self._content_user_cancel = False
+        self._content_again = set()       # roots changed while their content pass was running
+        self.searching = set()            # gens of running search workers (background passes pause)
+        # live updates (directory watchers)
+        self.v_live_on = tk.BooleanVar(value=bool(self.settings.get("live_updates", True)))
+        self.live = None
+        self.live_state = {}              # normcase(root) -> (root, ok, text)
+        self._live_dirty = set()
+        self._live_after = None
+        self._live_changed = False        # the index changed since the results were shown
+        self._search_after_index = False  # --scope: search once the new index is ready
+        self.settings_dialog = None
         # preview pane
         self.preview_gen = 0
         self._pv_after = None
@@ -2550,13 +3761,20 @@ class App(tk.Tk):
         self._build_ui()
         self._refresh_scopes()
         self._show_index_status()
+        self._live_indicator()
         self.after(60, self._poll)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        if index_info(self.db) is None:
+        if ctypes is not None:
+            self.live = LiveIndexer(self.q.put)
+        if scope:  # started from the Explorer menu / command line
+            self.after(200, lambda: self.open_scope(scope))
+        elif index_info(self.db) is None:
             self.after(300, self.rebuild_index)
-        else:
+        if index_info(self.db) is not None:
             self.after(1500, lambda: self._auto_check(startup=True))
             self.after(2500, self._exif_schedule)  # photo dates of new / changed images
+            self.after(3000, self._content_schedule)  # text of new / changed documents
+        self.after(800, self._live_sync)
         self.after(AUTO_TICK_MS, self._auto_tick)
         self.entry.focus_set()
 
@@ -2575,7 +3793,8 @@ class App(tk.Tk):
                   "auto": self.v_auto.get(), "sort": self.v_sort.get(), "date_format": self.v_datefmt.get(),
                   "geometry": self.geometry(), "roots": list(self.roots),
                   "all_roots": self.v_allroots.get(), "preview": self.v_preview.get(),
-                  "date_field": self._date_field()})
+                  "date_field": self._date_field(), "content_index": self.v_content_on.get(),
+                  "live_updates": self.v_live_on.get()})
         w = self._preview_width()
         if w:
             s["preview_width"] = w
@@ -2619,6 +3838,7 @@ class App(tk.Tk):
         ttk.Button(top, text="?", width=3, command=self.show_help).pack(side="left", padx=(4, 0))
         ttk.Button(top, text="Find duplicates…", command=self.open_duplicates).pack(side="left", padx=(12, 0))
         ttk.Button(top, text="Space…", command=self.open_space).pack(side="left", padx=(4, 0))
+        ttk.Button(top, text="Settings…", command=self.open_settings).pack(side="left", padx=(4, 0))
         self.v_preview = tk.BooleanVar(value=bool(s.get("preview", True)))
         ttk.Checkbutton(top, text="Preview", variable=self.v_preview,
                         command=self._preview_toggled).pack(side="left", padx=(10, 0))
@@ -2814,8 +4034,16 @@ class App(tk.Tk):
         cb_auto.bind("<<ComboboxSelected>>", lambda e: self._auto_changed())
         ttk.Label(bar, text="Auto-refresh:").pack(side="right", padx=(8, 2))
         ttk.Button(bar, text="Export CSV…", command=self.export_csv).pack(side="right")
+        # index status line (index / photo dates / content index progress) + live indicator
+        bar2 = ttk.Frame(self, padding=(8, 0, 8, 0))
+        bar2.pack(fill="x", side="bottom", before=self._vpane)
+        self.v_live = tk.StringVar()
+        self.l_live = ttk.Label(bar2, textvariable=self.v_live, foreground="#2e7d32", cursor="hand2")
+        self.l_live.pack(side="left")
+        self.l_live.bind("<Button-1>", lambda e: self.open_settings())
+        self.live_tip = Tooltip(self.l_live, "")
         self.v_index = tk.StringVar()
-        ttk.Label(bar, textvariable=self.v_index, foreground="#666").pack(side="right", padx=10)
+        ttk.Label(bar2, textvariable=self.v_index, foreground="#666").pack(side="left", padx=(10, 0))
         self._field_changed()
 
     def _fit_row4(self, row):
@@ -2851,6 +4079,10 @@ class App(tk.Tk):
         if info:
             built = self.fmt_time(float(info.get("built", 0)))
             extra = "  ·  incl. system folders" if info.get("system") == "1" else ""
+            if self.content_enabled():
+                ci = content_info(content_db_path(self.root_dir))
+                if ci.get("count"):
+                    extra += f"  ·  content index: {int(ci['count']):,} documents"
             self.v_index.set(f"{self.root_dir}  ·  {int(info.get('count', 0)):,} items  ·  indexed {built}{extra}")
         else:
             self.v_index.set(f"{self.root_dir}  ·  not indexed yet")
@@ -2941,8 +4173,10 @@ class App(tk.Tk):
         self._save_settings()
         self._refresh_scopes()
         self._show_index_status()
+        self._live_sync()
         if self.v_allroots.get():
             self.after(500, self._auto_check)
+            self.after(1500, self._content_schedule)
         self.search()
 
     def open_roots(self):
@@ -2957,6 +4191,7 @@ class App(tk.Tk):
             self._refresh_scopes()
         self.readme_cache = None
         self._show_index_status()
+        self._live_sync()
 
     def _auto_check(self, startup=False):
         """Rebuild in the background when an index is older than the auto-refresh setting.
@@ -2990,6 +4225,7 @@ class App(tk.Tk):
         try:
             self._auto_failed.clear()  # retry failed roots every tick, like before
             self._auto_check()
+            self._live_sync()  # (retries roots whose watcher failed, e.g. a network drive back online)
         finally:
             self.after(AUTO_TICK_MS, self._auto_tick)
 
@@ -3006,6 +4242,11 @@ class App(tk.Tk):
             self._exif_user_cancel = True
             self.exif_queue.clear()
             self.exif_cancel.set()
+            return
+        if self.content_running:  # the button reads "Cancel content index"
+            self._content_user_cancel = True
+            self.content_queue.clear()
+            self.content_cancel.set()
             return
         if self.v_allroots.get():  # rebuild every root, one after the other
             self.index_queue = [r for r in self._all_roots()[1:] if os.path.isdir(r)]
@@ -3025,10 +4266,14 @@ class App(tk.Tk):
         self.indexing = True
         if self.exif_running:  # the photo-date pass continues after the index build
             self.exif_cancel.set()
+        if self.content_running:  # so does the content index
+            self.content_cancel.set()
         self.index_cancel.clear()
         self.b_index.configure(text="Cancel indexing")
         root = os.path.abspath(root or self.root_dir)
         self.index_root = root
+        if self.live is not None:  # changes during the build are applied after it
+            self.live.hold(root)
         db, system = db_path_for(root), self.v_system.get()
 
         def work():
@@ -3055,8 +4300,11 @@ class App(tk.Tk):
 
     def change_root(self):
         d = filedialog.askdirectory(initialdir=self.root_dir, title="Folder to search")
-        if not d:
-            return
+        if d:
+            self._set_root(d)
+
+    def _set_root(self, d):
+        """Make d the current root (remembered in the roots list); index it if needed."""
         self.root_dir = os.path.abspath(d)
         self.db = db_path_for(self.root_dir)
         if not any(os.path.normcase(r) == os.path.normcase(self.root_dir) for r in self.roots):
@@ -3072,6 +4320,10 @@ class App(tk.Tk):
                 self.index_cancel.set()
             else:
                 self.rebuild_index()
+        else:
+            self._exif_schedule()
+            self._content_schedule()
+        self._live_sync()
 
     # ---- searching
     def _search_options(self):
@@ -3205,6 +4457,9 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.rows_taken = o["date_field"] == "taken"
         self.tree.heading("modified", text="Taken" if self.rows_taken else "Modified")
+        if self._live_changed:
+            self._live_changed = False
+            self._live_indicator()
         self._update_hints(o)
         self.b_stop.configure(state="normal")
         self.v_status.set("Searching…")
@@ -3221,29 +4476,57 @@ class App(tk.Tk):
                                           + (" - still reading photo dates" if self.exif_running else ""))
                               if x)
         note_txt = f"  ·  {notes}" if notes else ""
+        use_index = self.content_enabled()
+        pdftotext = self.pdftotext
+
+        def content_mode(indexed, live_roots, checked):
+            """How a File contents search was answered, for the status line."""
+            if not indexed:
+                why = ("regex" if o["regex"] else "content index off" if not use_index
+                       else "wildcards inside words" if fts_query(o["query"]) is None else "content index not built yet")
+                return f"{checked:,} text files scanned live - {why}"
+            if live_roots:
+                return f"indexed + live: {checked:,} files scanned live, {live_roots} root(s) without content index"
+            if checked:
+                return f"indexed + live: {checked:,} not yet indexed file(s) scanned"
+            return "content index"
 
         def work_multi():
             limit = int(o["limit"])
             if o["field"] == "content":
-                found, checked = [], 0
+                found, checked, total, indexed, live_roots = [], 0, 0, 0, 0
                 for i, (r, d, sc) in enumerate(targets, 1):
                     if cancel.is_set():
                         break
-                    n, c, note = search_contents(
-                        d, r, dict(o, scope=sc), self.pdftotext, cancel,
-                        lambda rows, r=r: found.extend(((os.path.join(r, x[0]),) + tuple(x[1:]), len(x[0]))
-                                                       for x in rows),
-                        lambda msg, i=i: self.q.put(("status", gen, f"Root {i}/{len(targets)}: {msg}")))
-                    if c == 0 and note and not o["regex"] and not parse_query(o["query"])[0]:
-                        return note
-                    checked += c
+                    oo = dict(o, scope=sc)
+                    collect = (lambda rows, r=r: found.extend(((os.path.join(r, x[0]),) + tuple(x[1:]), len(x[0]))
+                                                              for x in rows))
+                    prog = (lambda msg, i=i: self.q.put(("status", gen, f"Root {i}/{len(targets)}: {msg}")))
+                    res = (search_contents_indexed(d, content_db_path(r), r, oo, pdftotext, cancel, collect, prog)
+                           if use_index else None)
+                    if res is None:
+                        n, c, note = search_contents(d, r, oo, pdftotext, cancel, collect, prog)
+                        if c == 0 and note and not o["regex"] and not parse_query(o["query"])[0]:
+                            return note
+                        checked += c
+                        total += n
+                        live_roots += 1
+                    else:
+                        n, t, c, note = res
+                        if not n and not t and note.startswith("Type"):
+                            return note
+                        checked += c
+                        total += t
+                        indexed += 1
                 key = merge_sort_key(o)
                 found.sort(key=lambda x: key(x[0], x[1]))
                 rows = [x[0] for x in found[:limit]]
                 self.q.put(("rows", gen, rows))
-                shown = (f"{len(rows):,} of {len(found):,}+" if len(found) > limit else f"{len(rows):,}")
-                return (f"{shown} files contain your terms ({checked:,} text files checked in "
-                        f"{len(targets)} roots)" + (" - stopped" if cancel.is_set() else ""))
+                total = max(total, len(found))
+                shown = (f"{len(rows):,} of {total:,}" if total > len(rows) else f"{len(rows):,}")
+                mode = content_mode(indexed, live_roots if indexed else 0, checked)
+                return (f"{shown} files contain your terms in {len(targets)} roots ({mode})"
+                        + (" - stopped" if cancel.is_set() else ""))
             rows, total = search_names_multi(targets, o)
             self.q.put(("rows", gen, rows))
             if total > len(rows):
@@ -3253,19 +4536,31 @@ class App(tk.Tk):
             return f"{len(rows):,} results in {len(targets)} roots"
 
         def work():
+            self.searching.add(gen)
             try:
                 if multi:
                     msg = work_multi()
                 elif o["field"] == "content":
-                    n, checked, note = search_contents(
-                        db, root, o, self.pdftotext, cancel,
-                        lambda rows: self.q.put(("rows", gen, rows)),
-                        lambda msg: self.q.put(("status", gen, msg)))
-                    if checked == 0 and note:
-                        msg = note
+                    emit = lambda rows: self.q.put(("rows", gen, rows))
+                    prog = lambda msg: self.q.put(("status", gen, msg))
+                    res = (search_contents_indexed(db, content_db_path(root), root, o, pdftotext, cancel, emit, prog,
+                                                   replace=lambda rows: self.q.put(("replace", gen, rows)))
+                           if use_index else None)
+                    if res is None:
+                        n, checked, note = search_contents(db, root, o, pdftotext, cancel, emit, prog)
+                        if checked == 0 and note:
+                            msg = note
+                        else:
+                            msg = (f"{n:,} files contain your terms ({content_mode(0, 0, checked)}{note})"
+                                   + (" - stopped" if cancel.is_set() else ""))
                     else:
-                        msg = (f"{n:,} files contain your terms ({checked:,} text files checked{note})"
-                               + (" - stopped" if cancel.is_set() else ""))
+                        n, total, checked, note = res
+                        if not n and not total and note.startswith("Type"):
+                            msg = note
+                        else:
+                            shown = f"{n:,} of {total:,}" if total > n else f"{n:,}"
+                            msg = (f"{shown} files contain your terms ({content_mode(1, 0, checked)}{note})"
+                                   + (" - stopped" if cancel.is_set() else ""))
                 else:
                     rows, total = search_names(db, o, want_total=True)
                     self.q.put(("rows", gen, rows))
@@ -3278,6 +4573,8 @@ class App(tk.Tk):
                 self.q.put(("done", gen, f"{msg}  ·  {time.time() - t0:.2f} s{note_txt}"))
             except Exception as ex:
                 self.q.put(("done", gen, f"Search failed: {ex}"))
+            finally:
+                self.searching.discard(gen)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -3295,6 +4592,22 @@ class App(tk.Tk):
                     self.v_status.set(msg[2])
                 elif kind == "done" and msg[1] == self.gen:
                     self.pending.append(("__done__", msg[2]))
+                elif kind == "replace" and msg[1] == self.gen:  # final, re-sorted result list
+                    self.rows = []
+                    self.row_by_iid.clear()
+                    self.tree.delete(*self.tree.get_children())
+                    self.pending = list(msg[2]) + [p for p in self.pending if p[0] == "__done__"]
+                elif kind == "cprog":
+                    if not self.indexing and not self.exif_running:
+                        self.v_index.set(f"Content index: {msg[2]:,}/{msg[3]:,} files  ·  {msg[1]}")
+                elif kind == "cdone":
+                    self._content_done(*msg[1:])
+                elif kind == "live":
+                    self._live_applied(*msg[1:])
+                elif kind == "lstate":
+                    self._live_state(*msg[1:])
+                elif kind == "loverflow":
+                    self._live_overflow(msg[1])
                 elif kind == "preview" and msg[1] == self.preview_gen:
                     self._preview_show(msg[2])
                 elif kind == "iprog":
@@ -3319,6 +4632,9 @@ class App(tk.Tk):
         self.indexing = False
         self.b_index.configure(text="Rebuild index")
         root = self.index_root
+        if self.live is not None:
+            self.live.release(root)
+            self._live_sync()  # a new index can be watched now
         other = os.path.normcase(root) != os.path.normcase(self.root_dir)
         where = f" of {root}" if other else ""
         self._refresh_scopes()
@@ -3343,19 +4659,24 @@ class App(tk.Tk):
                                   f"({time.strftime('%H:%M')}). Search again to see changes.")
             else:
                 self.v_status.set(f"Index{where} ready: {n:,} items. Type to search.")
-                if self.v_query.get().strip() and not self.index_queue and (
+                if self._search_after_index and not self.index_queue:
+                    self._search_after_index = False
+                    self.search()
+                elif self.v_query.get().strip() and not self.index_queue and (
                         not other or self.v_allroots.get()):
                     self.search()
         else:
             self.index_queue.clear()  # cancelled
         if n is not None:
             self._exif_schedule([root], start=False)  # photo dates of the fresh index
+            self._content_schedule([root], start=False)  # then the text of its documents
         if self.index_queue:
             self.rebuild_index(root=self.index_queue.pop(0))
         else:
             if was_auto and (n is not None or err):
                 self.after(1000, self._auto_check)  # next stale root, one at a time
             self.after(300, self._exif_next)  # (waits if another index build starts)
+            self.after(400, self._content_next)
 
     # ---- photo dates (EXIF) in the background
     def _exif_schedule(self, roots=None, start=True):
@@ -3374,7 +4695,7 @@ class App(tk.Tk):
             self._exif_next()
 
     def _exif_next(self):
-        if self.exif_running or self.indexing or not self.exif_queue or not pil_modules():
+        if self.exif_running or self.indexing or self.content_running or not self.exif_queue or not pil_modules():
             return
         root = self.exif_queue.pop(0)
         db = db_path_for(root)
@@ -3416,6 +4737,189 @@ class App(tk.Tk):
             self.v_status.set("Reading photo dates stopped (continues at the next index refresh).")
         if not self._exif_user_cancel:
             self.after(200, self._exif_next)
+        self.after(300, self._content_next)
+
+    # ---- content index (full text) in the background
+    def content_enabled(self):
+        return bool(self.v_content_on.get()) and fts5_available()
+
+    def _content_schedule(self, roots=None, start=True):
+        """Queue an incremental content-index pass for roots (default: the searched roots)."""
+        if not self.content_enabled():
+            return
+        if roots is None:
+            roots = self._all_roots() if self.v_allroots.get() else [self.root_dir]
+        for r in roots:
+            k = os.path.normcase(r)
+            if self.content_running and os.path.normcase(self.content_root or "") == k:
+                self._content_again.add(k)
+                continue
+            if not any(os.path.normcase(q) == k for q in self.content_queue):
+                self.content_queue.append(r)
+        if start:
+            self._content_next()
+
+    def _content_next(self):
+        if (self.content_running or self.indexing or self.exif_running or not self.content_queue
+                or not self.content_enabled()):
+            return
+        root = self.content_queue.pop(0)
+        db = db_path_for(root)
+        if index_info(db) is None or not os.path.isdir(root):
+            self.after(10, self._content_next)
+            return
+        self.content_running = True
+        self.content_root = root
+        self._content_user_cancel = False
+        self.content_cancel = threading.Event()
+        cancel = self.content_cancel
+        self.b_index.configure(text="Cancel content index")
+        cdb, pdftotext = content_db_path(root), self.pdftotext
+
+        def work():
+            _low_priority_thread()
+            try:
+                res = content_pass(db, cdb, root, pdftotext, cancel,
+                                   lambda i, n: self.q.put(("cprog", root, i, n)),
+                                   pause=lambda: bool(self.searching))
+                self.q.put(("cdone", root, res, None))
+            except Exception as ex:  # e.g. the index is locked - try again later
+                self.q.put(("cdone", root, None, str(ex)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _content_done(self, root, res, err):
+        self.content_running = False
+        self.content_root = None
+        if not self.indexing:
+            self.b_index.configure(text="Rebuild index")
+        again = self._content_again
+        if (res is None and not err and not self._content_user_cancel) or os.path.normcase(root) in again:
+            again.discard(os.path.normcase(root))
+            if not any(os.path.normcase(q) == os.path.normcase(root) for q in self.content_queue):
+                self.content_queue.insert(0, root)  # interrupted / changed meanwhile: continue later
+        if not self.indexing:
+            self._show_index_status()
+        if err:
+            self.v_status.set(f"Content index of {root} failed: {err}")
+        elif res is not None and res[1] >= 50:
+            self.v_status.set(f"Content index updated: {res[1]:,} new/changed document(s) in {root}"
+                              + (" - search again to include them." if self.v_field.get() == "content" else "."))
+        elif res is None and self._content_user_cancel:
+            self.v_status.set("Content index stopped (continues at the next index refresh). File contents "
+                              "search scans the rest live.")
+        if self.settings_dialog is not None and self.settings_dialog.winfo_exists():
+            self.settings_dialog.refresh()
+        self.after(100, self._exif_next)
+        if not self._content_user_cancel:
+            self.after(300, self._content_next)
+
+    def _content_toggled(self):
+        self._save_settings()
+        if self.content_enabled():
+            self._content_schedule()
+        else:
+            self.content_queue.clear()
+            if self.content_running:
+                self._content_user_cancel = True
+                self.content_cancel.set()
+        self._show_index_status()
+
+    # ---- live updates (directory watchers)
+    def _live_targets(self):
+        roots = self._all_roots() if self.v_allroots.get() else [self.root_dir]
+        return [r for r in roots if os.path.isdir(r) and index_info(db_path_for(r)) is not None]
+
+    def _live_sync(self):
+        """Watch the searched roots (or nothing when Live updates is off)."""
+        if self.live is None:
+            self._live_indicator()
+            return
+        want = self._live_targets() if self.v_live_on.get() else []
+        keys = {os.path.normcase(r) for r in want}
+        for k in list(self.live_state):
+            if k not in keys:
+                del self.live_state[k]
+        try:
+            self.live.set_roots(want)
+        except Exception as ex:  # never let watching break the app
+            self.v_status.set(f"Live updates failed: {ex}")
+        self._live_indicator()
+
+    def _live_toggled(self):
+        self._save_settings()
+        self._live_sync()
+
+    def _live_indicator(self):
+        if self.live is None:
+            self.v_live.set("")
+            return
+        if not self.v_live_on.get():
+            self.v_live.set("○ live off")
+            self.l_live.configure(foreground="#888")
+            self.live_tip.text = "Live updates are off (Settings…). Auto-refresh keeps the index fresh."
+            return
+        states = list(self.live_state.values())
+        if not states:
+            self.v_live.set("")
+            return
+        bad = [(r, t) for r, ok, t in states if not ok]
+        hint = "  ·  index changed – search again" if self._live_changed else ""
+        if not bad:
+            self.v_live.set("● live" + hint)
+            self.l_live.configure(foreground="#2e7d32")
+            self.live_tip.text = ("Live updates: changes in " + ", ".join(r for r, ok, t in states)
+                                  + " reach the index within seconds.")
+        else:
+            self.v_live.set(("● live (%d of %d roots)" % (len(states) - len(bad), len(states))
+                             if len(bad) < len(states) else "○ not live – auto-refresh") + hint)
+            self.l_live.configure(foreground="#b26a00")
+            self.live_tip.text = ("Not watched (Auto-refresh keeps these fresh):\n"
+                                  + "\n".join(f"{r}: {t}" for r, t in bad))
+
+    def _live_state(self, root, ok, text):
+        k = os.path.normcase(os.path.abspath(root))
+        if self.live is None or not any(os.path.normcase(r) == k for r in self.live.roots()):
+            return
+        before = self.live_state.get(k)
+        self.live_state[k] = (root, ok, text)
+        if not ok and (before is None or before[1]):
+            self.v_status.set(f"Live updates are not possible for {root} ({text}) - Auto-refresh keeps its "
+                              "index fresh.")
+        self._live_indicator()
+
+    def _live_applied(self, root, changed, dirty, err):
+        if err:
+            self.v_status.set(f"Live update of the index of {root} failed ({err}) - use Rebuild index if needed.")
+            return
+        if not changed:
+            return
+        self.readme_cache = None
+        if not self.indexing and not self.exif_running and not self.content_running:
+            self._show_index_status()
+        if self.rows and not self._live_changed:
+            self._live_changed = True
+            self._live_indicator()
+        if dirty:  # documents / photos changed: update the text and photo dates a little later
+            self._live_dirty.add(root)
+            if self._live_after is None:
+                self._live_after = self.after(3000, self._live_passes)
+
+    def _live_passes(self):
+        self._live_after = None
+        roots, self._live_dirty = list(self._live_dirty), set()
+        self._exif_schedule(roots)
+        self._content_schedule(roots)
+
+    def _live_overflow(self, root):
+        """Too many changes at once for the watcher: rebuild that root's index in the background."""
+        self.v_status.set(f"Many changes at once in {root} - re-indexing it in the background.")
+        if self.indexing:
+            if os.path.normcase(self.index_root) != os.path.normcase(root) and not any(
+                    os.path.normcase(q) == os.path.normcase(root) for q in self.index_queue):
+                self.index_queue.append(root)
+        else:
+            self.rebuild_index(auto=True, root=root)
 
     def _flush_pending(self):
         n = 0
@@ -3804,6 +5308,76 @@ class App(tk.Tk):
         messagebox.showinfo(APP, "That folder is outside the indexed root. Use 'Change root…' instead.",
                             parent=parent or self)
         return False
+
+    # ---- settings window, command line
+    def open_settings(self):
+        if self.settings_dialog is not None and self.settings_dialog.winfo_exists():
+            self.settings_dialog.lift()
+            self.settings_dialog.refresh()
+            return
+        self.settings_dialog = SettingsDialog(self)
+
+    def open_scope(self, folder):
+        """--scope <folder> (Explorer 'QuickSearch here'): show that folder. If it is inside a
+        root, that root is used (all roots stay on if ticked) and Look in is set to the folder;
+        otherwise the user is asked whether to add its drive or only the folder as a new root."""
+        folder = os.path.abspath(clean_scope_arg(folder))
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+        if not os.path.isdir(folder):
+            messagebox.showerror(APP, f"This folder does not exist:\n{folder}", parent=self)
+            if index_info(self.db) is None:
+                self.rebuild_index()
+            return
+        multi = self.v_allroots.get()
+        inside = [r for r in self._all_roots() if path_in(folder, r)]
+        if inside:
+            if multi:
+                target = max(inside, key=len)  # the deepest root that contains it
+            elif path_in(folder, self.root_dir):
+                target = self.root_dir
+            else:
+                target = max(inside, key=len)
+                self._set_root(target)
+        else:
+            drive = drive_root(folder)
+            choice = ask_scope_root(self, folder, drive)
+            if choice is None:
+                self.v_status.set(f"{folder} is not inside an indexed root - nothing changed.")
+                self._ensure_index(self.root_dir)
+                return
+            target = drive if choice == "drive" else folder
+            if multi:
+                if not any(os.path.normcase(r) == os.path.normcase(target) for r in self.roots):
+                    self.roots.append(target)
+                self._roots_changed()
+            else:
+                self._set_root(target)
+        self._ensure_index(target)
+        self.v_scope.set(folder if multi else rel_to(folder, self.root_dir))
+        self._save_settings()
+        building = self.indexing and os.path.normcase(self.index_root) == os.path.normcase(target)
+        if index_info(db_path_for(target)) is not None and not building:
+            self.search()
+        else:
+            self._search_after_index = True
+            self.v_status.set(f"Indexing {target} so that {folder} can be searched…")
+        self.entry.focus_set()
+
+    def _ensure_index(self, root):
+        """Build the index of root unless it exists or is already being / about to be built."""
+        if index_info(db_path_for(root)) is not None:
+            return
+        k = os.path.normcase(os.path.abspath(root))
+        if self.indexing and (os.path.normcase(self.index_root) == k
+                              or (self._reindex_after and os.path.normcase(self.root_dir) == k)
+                              or any(os.path.normcase(q) == k for q in self.index_queue)):
+            return
+        self.rebuild_index(root=root)
 
     # ---- saved searches
     def saved_searches(self):
@@ -4490,7 +6064,9 @@ class App(tk.Tk):
             "  Name + folder path - words may be in any parent folder too\n"
             "    (e.g. 'project box dxf').\n"
             "  File contents - looks inside text/code files (asm, c, bas,\n"
-            "    txt, html…) and optionally PDFs. Press Enter to start.\n\n"
+            "    txt, html…), Word / Excel / PowerPoint, OpenDocument, RTF and\n"
+            "    PDFs. Press Enter to start. With the content index (below)\n"
+            "    this is instant; see CONTENT INDEX.\n\n"
             "FILTERS  Type, Look in (folder), size in MB, and Date (Modified, or\n"
             "  Taken for photos - see PHOTO DATES):\n"
             "  pick a preset (Today, Last 7 days, This month, Last year…), click 📅\n"
@@ -4551,6 +6127,41 @@ class App(tk.Tk):
             "  subfolders, children sorted by size, % of the parent folder) and\n"
             "  By type (per Type category and per extension). Double-click opens,\n"
             "  right-click: Show in Explorer / Search inside this folder.\n\n"
+            "CONTENT INDEX  (Settings…, default On) a full-text index of the\n"
+            "  documents of every searched root: text/code files, PDF (all pages,\n"
+            "  via pdftotext), docx / xlsx / pptx, odt / ods / odp and RTF (up to\n"
+            "  8 MB text, 100 MB PDF, 50 MB office files; 2 million characters per\n"
+            "  file). It is built in the background after indexing - only new and\n"
+            "  changed documents, at low priority, paused while you search; the\n"
+            "  status line shows 'Content index: 1,234/40,000 files' and 'Cancel\n"
+            "  content index' stops it. File contents searches then use it:\n"
+            "    vinc kumanda     both words (whole words, accents ignored)\n"
+            "    vinc*            words that start with vinc (vinçler, vinci…)\n"
+            "    \"uzaktan kumanda\"  exact phrase     -pdf   exclude a word\n"
+            "  together with Type, Look in, size, date (also Taken), Sort, Max\n"
+            "  results and all roots; 'Match in file' shows the text around the\n"
+            "  first word. Documents that are new or changed since the content\n"
+            "  index was updated are scanned live ('indexed + live' in the status\n"
+            "  line; PDFs only with 'Include PDF text'). Regex and wildcards inside\n"
+            "  a word (vi?c) always use the live scan (substring matching).\n\n"
+            "LIVE UPDATES  (Settings…, default On) while QuickSearch runs it\n"
+            "  watches the searched roots (the current root, or all roots) and\n"
+            "  updates the index within a few seconds when files or folders are\n"
+            "  created, changed, renamed, moved or deleted - also by other\n"
+            "  programs; the photo dates and the content index follow. '● live' in\n"
+            "  the status bar shows it is active (click it for the settings);\n"
+            "  'index changed – search again' means results on screen may be out\n"
+            "  of date. Drives that cannot be watched (some network drives) show\n"
+            "  '○ not live' and are kept fresh by Auto-refresh. After very many\n"
+            "  changes at once the root is simply re-indexed in the background.\n\n"
+            "EXPLORER MENU  Settings… > 'Add QuickSearch here to Explorer right-\n"
+            "  click menu' (asks first) adds an entry to the right-click menu of\n"
+            "  folders, folder backgrounds and drives (per user, registry keys\n"
+            "  under HKEY_CURRENT_USER\\Software\\Classes; 'Remove it' deletes them).\n"
+            "  It starts QuickSearch with Look in = that folder: the root that\n"
+            "  contains it is used; a folder outside every root can be added as a\n"
+            "  new root (its whole drive, or only the folder) and is indexed.\n"
+            "  Command line:  pythonw QuickSearch.pyw --scope \"F:\\Projects\"\n\n"
             "INDEX  Auto-refresh (bottom right) rebuilds the index in the background\n"
             "  when it is older than the chosen interval (default: Daily); searching\n"
             "  keeps working meanwhile. With 'Search all roots' on, the other roots'\n"
@@ -4561,6 +6172,12 @@ class App(tk.Tk):
         self.cancel.set()
         self.index_cancel.set()
         self.exif_cancel.set()
+        self.content_cancel.set()
+        if self.live is not None:
+            try:
+                self.live.stop()  # ends every directory watcher (CancelIoEx)
+            except Exception:
+                pass
         if self.dup_window is not None:
             self.dup_window.cancel.set()
         if self.space_window is not None:
@@ -4570,4 +6187,4 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    App(scope=parse_cli(sys.argv[1:])["scope"]).mainloop()
