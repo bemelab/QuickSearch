@@ -1,7 +1,7 @@
 """QuickSearch - fast, detailed file search for a large archive folder.
 
 Double-click to run (pythonw). Standard library (tkinter + sqlite3); Pillow is optional
-and only used for image thumbnails in the preview pane.
+and used for image thumbnails in the preview pane and the EXIF "date taken" of photos.
 
 * First start indexes every file and folder under the root (default: the folder
   this script is in). The index lives in %LOCALAPPDATA%\\QuickSearch, so the
@@ -22,6 +22,15 @@ and only used for image thumbnails in the preview pane.
 * "Find duplicates…" groups files with identical content (size, then BLAKE2b hash of
   the first 64 KB, then of the whole file) within the current filters, helps select
   the extra copies and sends them to the Recycle Bin - never the last copy.
+* "Space…" shows the biggest files, the biggest folders (expandable tree, sizes include
+  all subfolders) and the totals per type / extension, within the current filters.
+* The search box remembers the last 30 searches (drop-down); "☆ Save" stores the whole
+  search under a name, "Saved" restores and runs it ("Manage…" renames / deletes).
+* Date "Taken (photos)": filters and sorts by the EXIF date taken of photos (read in the
+  background after indexing into the index's exif table; needs Pillow).
+* Right-click > Rename… (F2) / Move to… / Copy to… for files and folders, with a
+  confirmation, Skip / Keep both / Overwrite for existing names, copy-then-delete between
+  drives and the index updated accordingly.
 """
 
 import calendar
@@ -42,7 +51,7 @@ import time
 import unicodedata
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 APP = "QuickSearch"
 DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), APP)
@@ -188,6 +197,7 @@ DATE_FORMATS = {"31.12.2026 (EU)": "%d.%m.%Y %H:%M",
 DEFAULT_DATE_FORMAT = "31.12.2026 (EU)"
 
 
+DATE_FIELDS = ("Modified", "Taken (photos)")  # what the date filters / Newest / Oldest use
 DATE_PRESETS = ["Any date", "Today", "Last 7 days", "Last 30 days", "This month", "Last month",
                 "This year", "Last year", "Custom"]
 
@@ -325,6 +335,33 @@ def _walk(root, include_system=False):
                     continue
 
 
+EXIF_TABLE_SQL = "CREATE TABLE IF NOT EXISTS exif(rel TEXT PRIMARY KEY, taken REAL, mtime REAL)"
+# images whose EXIF "date taken" is read in the background (HEIC only if Pillow can open it)
+EXIF_EXTS = ("jpg", "jpeg", "jpe", "tif", "tiff", "heic", "heif", "png", "webp")
+
+
+def has_table(con, name, schema="main"):
+    try:
+        return con.execute(f"SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?",
+                           (name,)).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def files_source(o, exif_ok, schema=""):
+    """FROM-clause source for a search. With the 'Taken (photos)' date mode it is the files
+    table joined with the EXIF dates, the date column (mtime) being the date taken; files
+    without an EXIF date (or an index without the exif table) give no rows."""
+    t = schema + "files"
+    if o.get("date_field") != "taken":
+        return t
+    if not exif_ok:
+        return f"(SELECT * FROM {t} WHERE 0)"
+    return (f"(SELECT f.rel AS rel, f.name AS name, f.ext AS ext, f.size AS size, e.taken AS mtime, "
+            f"f.isdir AS isdir, f.fname AS fname, f.fpath AS fpath FROM {t} f "
+            f"JOIN {schema}exif e ON e.rel = f.rel WHERE e.taken IS NOT NULL AND f.isdir = 0)")
+
+
 def build_index(root, db_path, progress=None, cancel=None, include_system=False):
     """Walk root and write a fresh index. Returns item count, or None if cancelled.
 
@@ -362,6 +399,20 @@ def build_index(root, db_path, progress=None, cancel=None, include_system=False)
     con.executemany("INSERT INTO meta VALUES (?,?)",
                     [("root", root), ("built", str(time.time())), ("count", str(n)),
                      ("system", "1" if include_system else "0")])
+    con.execute(EXIF_TABLE_SQL)
+    con.commit()
+    if os.path.isfile(db_path):  # keep the photo dates already read for unchanged files
+        try:
+            con.execute("ATTACH DATABASE ? AS old", (db_path,))
+            try:
+                if has_table(con, "exif", "old"):
+                    con.execute("INSERT OR IGNORE INTO exif SELECT e.rel, e.taken, e.mtime FROM old.exif e "
+                                "JOIN files f ON f.rel = e.rel AND f.mtime = e.mtime AND f.isdir = 0")
+            finally:
+                con.commit()
+                con.execute("DETACH DATABASE old")
+        except sqlite3.Error:
+            pass
     con.commit()
     con.close()
     for _ in range(20):  # the old index may be open by a running search for a moment
@@ -478,13 +529,14 @@ def search_names(db_path, o, want_total=False):
     else:
         order_sql = " ORDER BY mtime DESC"
     limit = int(o.get("limit") or 2000)
-    sql = f"SELECT rel, name, ext, size, mtime, isdir, ({score}) AS score FROM files{where_sql}{order_sql} LIMIT ?"
     con = _connect(db_path)
     try:
+        src = files_source(o, has_table(con, "exif"))
+        sql = f"SELECT rel, name, ext, size, mtime, isdir, ({score}) AS score FROM {src}{where_sql}{order_sql} LIMIT ?"
         rows = con.execute(sql, select_params + params + [limit]).fetchall()
         total = len(rows)
         if want_total and total >= limit:
-            total = con.execute(f"SELECT COUNT(*) FROM files{where_sql}", params).fetchone()[0]
+            total = con.execute(f"SELECT COUNT(*) FROM {src}{where_sql}", params).fetchone()[0]
     finally:
         con.close()
     rows = [(r[0], r[1], r[2], r[3], r[4], r[5], "") for r in rows]
@@ -529,7 +581,8 @@ def search_contents(db_path, root, o, pdftotext, cancel, emit, progress):
     params.append(MAX_TEXT_BYTES if not o.get("pdf") else 200 * 1048576)
     con = _connect(db_path)
     try:
-        cands = con.execute("SELECT rel, name, ext, size, mtime FROM files WHERE " + " AND ".join(where)
+        src = files_source(o, has_table(con, "exif"))
+        cands = con.execute(f"SELECT rel, name, ext, size, mtime FROM {src} WHERE " + " AND ".join(where)
                             + " ORDER BY mtime DESC LIMIT ?", params + [MAX_CONTENT_CANDIDATES]).fetchall()
     finally:
         con.close()
@@ -683,7 +736,8 @@ def find_duplicates(targets, o, min_bytes, quick, cancel, progress):
         for i, (root, db, w, p) in enumerate(parts):  # sizes of every root, then GROUP BY across roots
             con.execute("ATTACH DATABASE ? AS src", (db,))
             try:
-                con.execute(f"INSERT INTO allsizes SELECT size FROM src.files WHERE {w}", p)
+                srcsql = files_source(o, has_table(con, "exif", "src"), "src.")
+                con.execute(f"INSERT INTO allsizes SELECT size FROM {srcsql} WHERE {w}", p)
             finally:
                 con.commit()
                 con.execute("DETACH DATABASE src")
@@ -692,8 +746,9 @@ def find_duplicates(targets, o, min_bytes, quick, cancel, progress):
         for root, db, w, p in parts:
             con.execute("ATTACH DATABASE ? AS src", (db,))
             try:
+                srcsql = files_source(o, has_table(con, "exif", "src"), "src.")
                 cands += [(os.path.join(root, rel), size) for rel, size in con.execute(
-                    f"SELECT rel, size FROM src.files WHERE {w} AND size IN (SELECT size FROM cs)", p)]
+                    f"SELECT rel, size FROM {srcsql} WHERE {w} AND size IN (SELECT size FROM cs)", p)]
             finally:
                 con.commit()
                 con.execute("DETACH DATABASE src")
@@ -935,6 +990,404 @@ def build_preview(path, isdir, ext, size, box, pdftotext):
     except Exception as ex:  # unreadable / locked / anything else - never crash the UI
         res.update(kind="info", image=None, text=f"Cannot preview: {ex}")
     return res
+
+
+# ---------------------------------------------------------------- photo dates (EXIF)
+def read_taken(path):
+    """EXIF date taken of an image file (timestamp) or None. Needs Pillow."""
+    pil = pil_modules()
+    if not pil:
+        return None
+    try:
+        with pil[0].open(path) as im:  # only the header is read
+            return _exif_taken(im)
+    except Exception:  # not an image Pillow can open (e.g. HEIC without a plugin), locked…
+        return None
+
+
+def exif_pass(db_path, root, cancel, progress):
+    """Read the EXIF date taken of the images in an index into its exif table (created if
+    missing). Incremental: images already stored with the same mtime are skipped; rows of
+    files that left the index are dropped. The index is opened only briefly, so searching
+    and rebuilding keep working. progress(done, todo). Returns (images, newly_read, dated)
+    or None if cancelled."""
+    con = sqlite3.connect(db_path, timeout=10)
+    try:
+        con.execute(EXIF_TABLE_SQL)
+        con.commit()
+        stored = dict(con.execute("SELECT rel, mtime FROM exif"))
+        files = con.execute("SELECT rel, mtime FROM files WHERE isdir = 0 AND ext IN (%s)"
+                            % ",".join("?" * len(EXIF_EXTS)), EXIF_EXTS).fetchall()
+        live = {r for r, _ in files}
+        gone = [(r,) for r in stored if r not in live]
+        if gone:
+            con.executemany("DELETE FROM exif WHERE rel = ?", gone)
+            con.commit()
+    finally:
+        con.close()
+    todo = [(rel, mtime) for rel, mtime in files if stored.get(rel) != mtime]
+    batch, done, dated, last = [], 0, 0, 0.0
+
+    def flush():
+        if batch:
+            c = sqlite3.connect(db_path, timeout=10)
+            try:
+                c.execute(EXIF_TABLE_SQL)
+                c.executemany("INSERT OR REPLACE INTO exif VALUES (?,?,?)", batch)
+                c.commit()
+            finally:
+                c.close()
+            batch.clear()
+
+    t_flush = time.time()
+    for rel, mtime in todo:
+        if cancel.is_set():
+            flush()  # keep what was read so far
+            return None
+        taken = read_taken(os.path.join(root, rel))
+        dated += taken is not None
+        batch.append((rel, taken, mtime))  # NULL = no EXIF date (not read again until it changes)
+        done += 1
+        if len(batch) >= 500 or time.time() - t_flush > 2:
+            flush()
+            t_flush = time.time()
+        if time.time() - last > 0.3:
+            last = time.time()
+            progress(done, len(todo))
+    flush()
+    return len(files), len(todo), dated
+
+
+# ---------------------------------------------------------------- keeping an index up to date
+def _index_row(rel, name, isdir, size, mtime):
+    ext = "" if isdir else os.path.splitext(name)[1][1:].lower()
+    return (rel, name, ext, size, mtime, 1 if isdir else 0, fold(name), fold(rel))
+
+
+def _delete_rel(con, rel, isdir):
+    """Delete rel (and, for a folder, everything below it) from files and exif. Returns count."""
+    f = fold(rel)
+    n = con.execute("DELETE FROM files WHERE rel = ?", (rel,)).rowcount
+    under = ("(fpath = ? OR fpath LIKE ? ESCAPE '\\') AND substr(rel, 1, ?) = ?",
+             (f, like_escape(f + "\\") + "%", len(rel) + 1, rel + "\\"))
+    if isdir:
+        n += con.execute("DELETE FROM files WHERE " + under[0], under[1]).rowcount
+    if has_table(con, "exif"):
+        con.execute("DELETE FROM exif WHERE rel = ? OR substr(rel, 1, ?) = ?", (rel, len(rel) + 1, rel + "\\"))
+    return n
+
+
+def _adjust_count(con, delta):
+    if delta:
+        con.execute("UPDATE meta SET v = CAST(MAX(0, CAST(v AS INTEGER) + ?) AS TEXT) WHERE k = 'count'", (delta,))
+
+
+def index_remove(db_path, items):
+    """Remove [(rel, isdir)] (folders with their contents) from an index. Returns rows removed."""
+    con = sqlite3.connect(db_path, timeout=5)
+    try:
+        n = sum(_delete_rel(con, rel, isdir) for rel, isdir in items)
+        _adjust_count(con, -n)
+        con.commit()
+        return n
+    finally:
+        con.close()
+
+
+def index_add(db_path, root, fulls):
+    """(Re)index absolute paths inside root as they are on disk now (folders with all their
+    contents, following the index's system-folder setting). Returns rows inserted."""
+    con = sqlite3.connect(db_path, timeout=5)
+    try:
+        meta = dict(con.execute("SELECT k, v FROM meta"))
+        system = meta.get("system") == "1"
+        added = removed = 0
+        for full in fulls:
+            full = os.path.abspath(full)
+            rel = rel_to(full, root)
+            if not rel:
+                continue
+            try:
+                st = os.stat(full, follow_symlinks=False)
+            except OSError:
+                continue
+            isdir = os.path.isdir(full) and not os.path.islink(full)
+            removed += _delete_rel(con, rel, True)
+            rows = [_index_row(rel, os.path.basename(full), isdir, 0 if isdir else st.st_size, st.st_mtime)]
+            if isdir:
+                for path, name, d, size, mtime in _walk(full, system):
+                    rows.append(_index_row(rel + path[len(full):], name, d, size, mtime))
+            con.executemany("INSERT INTO files VALUES (?,?,?,?,?,?,?,?)", rows)
+            added += len(rows)
+        _adjust_count(con, added - removed)
+        con.commit()
+        return added
+    finally:
+        con.close()
+
+
+def exif_get(db_path, rel):
+    """{suffix: (taken, mtime)} of the photo dates stored for rel and anything below it."""
+    con = sqlite3.connect(db_path, timeout=5)
+    try:
+        if not has_table(con, "exif"):
+            return {}
+        return {r[len(rel):]: (t, m) for r, t, m in con.execute(
+            "SELECT rel, taken, mtime FROM exif WHERE rel = ? OR substr(rel, 1, ?) = ?",
+            (rel, len(rel) + 1, rel + "\\"))}
+    finally:
+        con.close()
+
+
+def exif_put(db_path, rel, dates):
+    """Store photo dates read with exif_get under a new rel (after a rename / move / copy)."""
+    if not dates:
+        return
+    con = sqlite3.connect(db_path, timeout=5)
+    try:
+        con.execute(EXIF_TABLE_SQL)
+        con.executemany("INSERT OR REPLACE INTO exif VALUES (?,?,?)",
+                        [(rel + suffix, t, m) for suffix, (t, m) in dates.items()])
+        con.commit()
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------- disk space
+def space_scan(targets, o, top_n, cancel, progress):
+    """Disk usage from the index within the search filters (Type, Look in, size, date).
+
+    targets: [(root, db, relative_scope)]. Returns None if cancelled, else a dict:
+    files  = top_n biggest files as result rows (rel = ABSOLUTE path), biggest first
+    trees  = [(root, top_rel, {folder_rel: [bytes, files]}, {folder_rel: [bytes, files] directly in it})]
+             (sizes include every descendant)
+    exts   = {ext: [bytes, files]},  total = [bytes, files]"""
+    top_n = max(1, int(top_n))
+    out = {"files": [], "trees": [], "exts": collections.defaultdict(lambda: [0, 0]), "total": [0, 0]}
+    biggest = []
+    counts = []
+    for root, db, scope in targets:
+        where, params = filter_clauses(dict(o, scope=scope), None)
+        con = _connect(db)
+        try:
+            src = files_source(o, has_table(con, "exif"))
+            w = (" WHERE " + " AND ".join(where)) if where else ""
+            counts.append(con.execute(f"SELECT COUNT(*) FROM {src}{w}", params).fetchone()[0])
+        finally:
+            con.close()
+    total_rows, seen_rows, last = max(1, sum(counts)), 0, 0.0
+    for root, db, scope in targets:
+        if cancel.is_set():
+            return None
+        where, params = filter_clauses(dict(o, scope=scope), None)
+        top = (scope or "").strip().strip("\\/").replace("/", "\\")
+        agg, direct = {top: [0, 0]}, {}
+        exts, total = out["exts"], out["total"]
+        con = _connect(db)
+        try:
+            src = files_source(o, has_table(con, "exif"))
+            w = (" WHERE " + " AND ".join(where)) if where else ""
+            wf = " WHERE " + " AND ".join(where + ["isdir = 0"])
+            biggest += [(os.path.join(root, r[0]),) + tuple(r[1:]) + ("",) for r in con.execute(
+                f"SELECT rel, name, ext, size, mtime, isdir FROM {src}{wf} ORDER BY size DESC LIMIT ?",
+                params + [top_n])]
+            cur = con.execute(f"SELECT rel, size, ext, isdir FROM {src}{w}", params)
+            while True:
+                chunk = cur.fetchmany(5000)
+                if not chunk:
+                    break
+                if cancel.is_set():
+                    return None
+                for rel, size, ext, isdir in chunk:
+                    if isdir:
+                        if len(rel) > len(top) and rel not in agg:
+                            agg[rel] = [0, 0]
+                        continue
+                    size = size or 0
+                    total[0] += size
+                    total[1] += 1
+                    e = exts[ext or ""]
+                    e[0] += size
+                    e[1] += 1
+                    d, first = rel, True
+                    while len(d) > len(top):  # add the file to every folder above it, up to the top
+                        i = d.rfind("\\")
+                        d = d[:i] if i >= 0 else ""
+                        a = agg.get(d)
+                        if a is None:
+                            agg[d] = [size, 1]
+                        else:
+                            a[0] += size
+                            a[1] += 1
+                        if first:
+                            a = direct.get(d)
+                            if a is None:
+                                direct[d] = [size, 1]
+                            else:
+                                a[0] += size
+                                a[1] += 1
+                            first = False
+                seen_rows += len(chunk)
+                if time.time() - last > 0.25:
+                    last = time.time()
+                    progress(f"Adding up {seen_rows:,} / {total_rows:,} index entries…", seen_rows / total_rows)
+        finally:
+            con.close()
+        # the scope text may differ in case from the folder names in the index
+        if top and agg[top] == [0, 0]:
+            for k in agg:
+                if len(k) == len(top) and k != top and fold(k) == fold(top):
+                    agg.pop(top)
+                    top = k
+                    break
+        out["trees"].append((root, top, agg, direct))
+    biggest.sort(key=lambda r: (-(r[3] or 0), r[0].lower()))
+    out["files"] = biggest[:top_n]
+    out["exts"] = dict(out["exts"])
+    progress("Done.", 1.0)
+    return out
+
+
+def type_category_totals(exts):
+    """{TYPES category: [bytes, files]} from {ext: [bytes, files]}; 'Other' collects the rest
+    (an extension listed in two categories, e.g. js, counts in both)."""
+    cats = collections.OrderedDict()
+    known = set()
+    for name, tdef in TYPES.items():
+        if not tdef or tdef == "<dir>":
+            continue
+        members = set(tdef.split())
+        known |= members
+        v = [0, 0]
+        for e in members:
+            if e in exts:
+                v[0] += exts[e][0]
+                v[1] += exts[e][1]
+        cats[name] = v
+    other = [0, 0]
+    for e, (b, n) in exts.items():
+        if e not in known:
+            other[0] += b
+            other[1] += n
+    cats["Other"] = other
+    return cats
+
+
+# ---------------------------------------------------------------- file operations
+INVALID_NAME_CHARS = set('\\/:*?"<>|')
+
+
+def same_volume(a, b):
+    """True when a and b are on the same drive, so a rename can move between them."""
+    da = os.path.splitdrive(os.path.abspath(a))[0].lower()
+    return bool(da) and da == os.path.splitdrive(os.path.abspath(b))[0].lower()
+
+
+def keep_both_name(folder, name, isdir, taken=()):
+    """'name (2).ext', 'name (3).ext'… - the first one that does not exist in folder and is
+    not in taken (normcase'd full paths already planned)."""
+    base, ext = (name, "") if isdir else os.path.splitext(name)
+    i = 2
+    while True:
+        p = os.path.join(folder, f"{base} ({i}){ext}")
+        if not os.path.lexists(p) and os.path.normcase(p) not in taken:
+            return f"{base} ({i}){ext}"
+        i += 1
+
+
+def _is_dir(p):
+    return os.path.isdir(p) and not os.path.islink(p)
+
+
+def _remove_item(path):
+    if _is_dir(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+
+def _tree_stats(path):
+    """(files, bytes) of a file or a folder tree."""
+    if not _is_dir(path):
+        return 1, os.path.getsize(path)
+    n = b = 0
+    for d, _, fs in os.walk(path):
+        for f in fs:
+            n += 1
+            b += os.path.getsize(os.path.join(d, f))
+    return n, b
+
+
+def transfer_item(src, dst, op, overwrite=False):
+    """Copy (op 'copy') or move (op 'move') the file or folder src to the full path dst.
+
+    Never loses data: a move between drives copies first, checks the copy and only then
+    deletes the original; an overwritten destination is renamed aside and only deleted after
+    success (restored on failure); a failed copy removes its own partial copy. Raises OSError
+    on failure (source untouched). Returns a note ('' normally)."""
+    if not os.path.lexists(src):
+        raise FileNotFoundError("the item no longer exists")
+    if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
+        raise OSError("source and destination are the same")
+    backup = None
+    if os.path.lexists(dst):
+        if not overwrite:
+            raise FileExistsError("the destination already exists")
+        backup = dst + ".qs-replaced"
+        i = 2
+        while os.path.lexists(backup):
+            backup = dst + f".qs-replaced{i}"
+            i += 1
+        os.rename(dst, backup)
+    note = ""
+    try:
+        moved = False
+        if op == "move" and same_volume(src, dst):
+            try:
+                os.rename(src, dst)
+                moved = True
+            except OSError as ex:
+                if getattr(ex, "winerror", None) != 17:  # 17 = not the same device: copy instead
+                    raise
+        if not moved:
+            try:
+                if _is_dir(src):
+                    shutil.copytree(src, dst, symlinks=True)
+                else:
+                    shutil.copy2(src, dst)
+                if op == "move" and _tree_stats(src) != _tree_stats(dst):
+                    raise OSError("the copy does not match the original (files / bytes differ)")
+            except BaseException:
+                if os.path.lexists(dst):  # our own partial copy
+                    try:
+                        _remove_item(dst)
+                    except OSError:
+                        pass
+                raise
+            if op == "move":
+                try:
+                    _remove_item(src)
+                except OSError as ex:
+                    if not _is_dir(src):  # nothing gained: keep only the original
+                        try:
+                            _remove_item(dst)
+                        except OSError:
+                            pass
+                        raise OSError(f"the original could not be removed ({ex}) - not moved") from None
+                    note = f"copied, but part of the original folder could not be removed ({ex})"
+    except BaseException:
+        if backup and not os.path.lexists(dst):
+            try:
+                os.rename(backup, dst)
+            except OSError:
+                pass
+        raise
+    if backup:
+        try:
+            _remove_item(backup)
+        except OSError as ex:
+            note = (note + "; " if note else "") + f"the replaced item is kept as {backup} ({ex})"
+    return note
 
 
 # ---------------------------------------------------------------- GUI
@@ -1224,8 +1677,11 @@ class DupWindow(tk.Toplevel):
             parts.append(f"Look in: {o['scope'].strip()}")
         if o["min_mb"] or o["max_mb"]:
             parts.append(f"Size MB: {o['min_mb'] or '0'} … {o['max_mb'] or '∞'}")
+        taken = o.get("date_field") == "taken"
         if o["date_from"] or o["date_to"]:
-            parts.append(f"Modified: {o['date_from'] or '…'} to {o['date_to'] or '…'}")
+            parts.append(f"{'Taken' if taken else 'Modified'}: {o['date_from'] or '…'} to {o['date_to'] or '…'}")
+        if taken:
+            parts.append("only photos with an EXIF date")
         self.v_scope.set("  ·  ".join(parts) + "   (filters come from the main window)")
 
     def start(self):
@@ -1520,6 +1976,511 @@ class DupWindow(tk.Toplevel):
         self.destroy()
 
 
+class Tooltip:
+    """Small hover text for a widget (also works on disabled widgets)."""
+
+    def __init__(self, widget, text):
+        self.widget, self.text, self.tip = widget, text, None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, event=None):
+        if self.tip or not self.text:
+            return
+        self.tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.geometry(f"+{self.widget.winfo_rootx() + 10}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}")
+        tk.Label(tw, text=self.text, background="#ffffe0", relief="solid", borderwidth=1, justify="left",
+                 wraplength=420, font=("Segoe UI", 9), padx=6, pady=3).pack()
+
+    def _hide(self, event=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+def ask_conflict(parent, op, count, examples):
+    """Ask ONCE what to do with items whose name already exists at the destination.
+    Returns 'skip', 'keep' (keep both: add ' (2)'), 'overwrite' or None (cancel)."""
+    win = tk.Toplevel(parent)
+    win.title(APP + " - name conflict")
+    win.resizable(False, False)
+    win.transient(parent)
+    res = [None]
+    body = ttk.Frame(win, padding=12)
+    body.pack(fill="both", expand=True)
+    lines = "\n".join("• " + e for e in examples[:10]) + (f"\n… and {count - 10:,} more" if count > 10 else "")
+    ttk.Label(body, text=f"{count:,} item(s) to {op} already exist at the destination:", font=("Segoe UI", 9, "bold")
+              ).pack(anchor="w")
+    ttk.Label(body, text=lines, foreground="#444", wraplength=700, justify="left").pack(anchor="w", pady=(4, 8))
+    ttk.Label(body, text="What should happen with all of them?").pack(anchor="w")
+    btns = ttk.Frame(body)
+    btns.pack(fill="x", pady=(10, 0))
+
+    def done(v):
+        res[0] = v
+        win.destroy()
+
+    b_skip = ttk.Button(btns, text="Skip them", command=lambda: done("skip"))
+    b_skip.pack(side="left")
+    ttk.Button(btns, text="Keep both (add ' (2)')", command=lambda: done("keep")).pack(side="left", padx=6)
+    ttk.Button(btns, text="Overwrite…", command=lambda: done("overwrite")).pack(side="left")
+    ttk.Button(btns, text="Cancel", command=lambda: done(None)).pack(side="right")
+    win.bind("<Escape>", lambda e: done(None))
+    win.protocol("WM_DELETE_WINDOW", lambda: done(None))
+    win.update_idletasks()
+    try:
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - win.winfo_width()) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - win.winfo_height()) // 3)
+        win.geometry(f"+{x}+{y}")
+    except tk.TclError:
+        pass
+    b_skip.focus_set()
+    win.grab_set()
+    win.wait_window()
+    return res[0]
+
+
+class SavedDialog(tk.Toplevel):
+    """Manage saved searches: run, rename, reorder, delete."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title(APP + " - saved searches")
+        self.geometry("620x320")
+        self.minsize(460, 220)
+        self.transient(app)
+        mid = ttk.Frame(self, padding=(8, 8, 8, 0))
+        mid.pack(fill="both", expand=True)
+        self.lb = tk.Listbox(mid, font=("Segoe UI", 9), activestyle="none")
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.lb.yview)
+        self.lb.configure(yscrollcommand=sb.set)
+        self.lb.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.lb.bind("<Double-1>", lambda e: self.run())
+        bar = ttk.Frame(self, padding=8)
+        bar.pack(fill="x")
+        for txt, cmd in (("Run", self.run), ("Rename…", self.rename), ("Delete…", self.delete),
+                         ("Move up", lambda: self.move(-1)), ("Move down", lambda: self.move(1))):
+            ttk.Button(bar, text=txt, command=cmd).pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="Close", command=self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.refresh()
+
+    def refresh(self, select=None):
+        self.lb.delete(0, "end")
+        for s in self.app.saved_searches():
+            self.lb.insert("end", f"{s.get('name', '?')}    —    {self.app.describe_saved(s)}")
+        if select is not None and self.lb.size():
+            i = max(0, min(select, self.lb.size() - 1))
+            self.lb.selection_set(i)
+            self.lb.see(i)
+
+    def _index(self):
+        sel = self.lb.curselection()
+        return sel[0] if sel else None
+
+    def run(self):
+        i = self._index()
+        if i is not None:
+            self.app.restore_saved(self.app.saved_searches()[i])
+
+    def rename(self):
+        i = self._index()
+        if i is None:
+            return
+        lst = self.app.saved_searches()
+        name = simpledialog.askstring(APP, "New name for this saved search:", initialvalue=lst[i].get("name", ""),
+                                      parent=self)
+        name = (name or "").strip()
+        if not name or name == lst[i].get("name"):
+            return
+        if any(s.get("name") == name for j, s in enumerate(lst) if j != i):
+            messagebox.showerror(APP, f"A saved search called '{name}' already exists.", parent=self)
+            return
+        lst[i]["name"] = name
+        self.app._save_settings()
+        self.refresh(i)
+
+    def delete(self):
+        i = self._index()
+        if i is None:
+            return
+        lst = self.app.saved_searches()
+        if messagebox.askyesno(APP, f"Delete the saved search '{lst[i].get('name')}'?", default="no", parent=self):
+            del lst[i]
+            self.app._save_settings()
+            self.refresh(i)
+
+    def move(self, d):
+        i = self._index()
+        lst = self.app.saved_searches()
+        if i is None or not 0 <= i + d < len(lst):
+            return
+        lst[i], lst[i + d] = lst[i + d], lst[i]
+        self.app._save_settings()
+        self.refresh(i + d)
+
+
+class SpaceWindow(tk.Toplevel):
+    """Disk space from the index: biggest files, biggest folders (tree), totals by type."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title(APP + " - disk space")
+        self.geometry("1100x650")
+        self.minsize(820, 420)
+        self.q = queue.Queue()
+        self.cancel = threading.Event()
+        self.gen = 0
+        self.running = False
+        self.result = None
+        self.file_rows = {}   # iid -> result row (absolute rel) in the Biggest files list
+        self.nodes = {}       # iid -> (tree index, folder rel) in the Biggest folders tree
+        self.taken = False
+        s = app.settings
+
+        top = ttk.Frame(self, padding=(8, 8, 8, 2))
+        top.pack(fill="x")
+        ttk.Label(top, text="Biggest files to list").pack(side="left")
+        self.v_top = tk.StringVar(value=str(s.get("space_top_n", 500)))
+        e = ttk.Spinbox(top, from_=10, to=100000, increment=100, textvariable=self.v_top, width=8)
+        e.pack(side="left", padx=(4, 14))
+        e.bind("<Return>", lambda ev: self.start())
+        self.b_start = ttk.Button(top, text="Calculate", command=self.start)
+        self.b_start.pack(side="left")
+        self.b_cancel = ttk.Button(top, text="Cancel", command=lambda: self.cancel.set(), state="disabled")
+        self.b_cancel.pack(side="left", padx=4)
+        ttk.Button(top, text="Close", command=self.close).pack(side="right")
+        self.v_scope = tk.StringVar()
+        ttk.Label(self, textvariable=self.v_scope, foreground="#666", padding=(8, 2), wraplength=1060
+                  ).pack(fill="x")
+        prog = ttk.Frame(self, padding=(8, 2))
+        prog.pack(fill="x")
+        self.pb = ttk.Progressbar(prog, mode="determinate", maximum=1000, length=260)
+        self.pb.pack(side="left")
+        self.v_prog = tk.StringVar(value="")
+        ttk.Label(prog, textvariable=self.v_prog).pack(side="left", padx=8)
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        # (a) biggest files
+        f1 = ttk.Frame(self.nb, padding=4)
+        self.t_files = self._make_tree(f1, ("name", "folder", "size", "modified", "type"),
+                                       {"name": ("Name", 260, False), "folder": ("Folder", 440, True),
+                                        "size": ("Size", 90, False), "modified": ("Modified", 130, False),
+                                        "type": ("Type", 60, False)}, show="headings")
+        self.nb.add(f1, text="Biggest files")
+        # (b) biggest folders
+        f2 = ttk.Frame(self.nb, padding=4)
+        self.t_dirs = self._make_tree(f2, ("size", "files", "pct", "bar"),
+                                      {"#0": ("Folder (sizes include all subfolders)", 520, True),
+                                       "size": ("Size", 100, False), "files": ("Files", 90, False),
+                                       "pct": ("% of parent", 90, False), "bar": ("", 110, False)},
+                                      show="tree headings")
+        self.t_dirs.tag_configure("direct", foreground="#666")
+        self.t_dirs.bind("<<TreeviewOpen>>", self._dir_open)
+        self.nb.add(f2, text="Biggest folders")
+        # (c) by type
+        f3 = ttk.Frame(self.nb, padding=4)
+        pw = ttk.PanedWindow(f3, orient="horizontal")
+        pw.pack(fill="both", expand=True)
+        a, b = ttk.Frame(pw), ttk.Frame(pw)
+        self.t_cats = self._make_tree(a, ("size", "files", "pct"),
+                                      {"#0": ("Category (Type list) / extension", 250, True),
+                                       "size": ("Size", 90, False), "files": ("Files", 80, False),
+                                       "pct": ("% of total", 80, False)}, show="tree headings")
+        self.t_exts = self._make_tree(b, ("ext", "size", "files", "pct"),
+                                      {"ext": ("Extension", 110, True), "size": ("Size", 90, False),
+                                       "files": ("Files", 80, False), "pct": ("% of total", 80, False)},
+                                      show="headings")
+        pw.add(a, weight=1)
+        pw.add(b, weight=1)
+        self.nb.add(f3, text="By type")
+        for t in (self.t_files, self.t_dirs):
+            t.bind("<Double-1>", self._on_double)
+            t.bind("<Button-3>", self._context_menu)
+            t.bind("<Return>", lambda e: self.open_selected())
+
+        self.menu = tk.Menu(self, tearoff=0)
+        self.menu.add_command(label="Open", command=self.open_selected)
+        self.menu.add_command(label="Show in Explorer", command=self.reveal_selected)
+        self.menu.add_command(label="Search inside this folder", command=self.search_inside)
+        self.menu.add_separator()
+        self.menu.add_command(label="Copy full path", command=self.copy_path)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        self._describe_scope()
+        self.after(60, self._poll)
+        self.after(100, self.start)
+
+    @staticmethod
+    def _make_tree(parent, cols, spec, show):
+        t = ttk.Treeview(parent, columns=cols, show=show, selectmode="browse")
+        for c, (txt, w, stretch) in spec.items():
+            t.heading(c, text=txt)
+            t.column(c, width=w, stretch=stretch, anchor="e" if c in ("size", "files", "pct") else "w")
+        ys = ttk.Scrollbar(parent, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=ys.set)
+        t.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+        return t
+
+    def _describe_scope(self, o=None, targets=None):
+        DupWindow._describe_scope(self, o, targets)
+
+    # ---- computing
+    def start(self):
+        if self.running:
+            return
+        try:
+            n = int(float(self.v_top.get().strip() or "500"))
+            if n < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(APP, "'Biggest files to list' must be a whole number.", parent=self)
+            return
+        o = self.app._search_options()
+        try:
+            for k in ("min_mb", "max_mb"):
+                if o[k]:
+                    float(o[k])
+            parse_date(o["date_from"])
+            parse_date(o["date_to"], end=True)
+        except ValueError as ex:
+            messagebox.showerror(APP, f"Check the filters in the main window: {ex}", parent=self)
+            return
+        targets, notes = self.app._search_targets(o["scope"])
+        self._describe_scope(o, targets)
+        if not targets:
+            self.v_prog.set(f"Nothing to measure: {notes or 'no index yet'}.")
+            return
+        self.app.settings["space_top_n"] = n
+        self.app._save_settings()
+        self.taken = o.get("date_field") == "taken"
+        self.t_files.heading("modified", text="Taken" if self.taken else "Modified")
+        self.cancel = threading.Event()
+        self.gen += 1
+        gen, cancel = self.gen, self.cancel
+        self.running = True
+        self.b_start.configure(state="disabled")
+        self.b_cancel.configure(state="normal")
+        self.pb.configure(value=0)
+        self.v_prog.set("Reading the index…")
+        self._t0 = time.time()
+
+        def work():
+            try:
+                res = space_scan(targets, o, n, cancel, lambda t, f: self.q.put(("prog", gen, t, f)))
+                self.q.put(("done", gen, res, None))
+            except Exception as ex:  # report in the window
+                self.q.put(("done", gen, None, str(ex)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        try:
+            for _ in range(100):
+                msg = self.q.get_nowait()
+                if msg[1] != self.gen:
+                    continue
+                if msg[0] == "prog":
+                    self.v_prog.set(msg[2])
+                    self.pb.configure(value=int(msg[3] * 1000))
+                elif msg[0] == "done":
+                    self._finished(*msg[2:])
+        except queue.Empty:
+            pass
+        self.after(80, self._poll)
+
+    def _finished(self, res, err):
+        self.running = False
+        self.b_start.configure(state="normal")
+        self.b_cancel.configure(state="disabled")
+        if err:
+            self.v_prog.set(f"Failed: {err}")
+            return
+        if res is None:
+            self.v_prog.set("Cancelled.")
+            self.pb.configure(value=0)
+            return
+        self.result = res
+        self.pb.configure(value=1000)
+        tb, tn = res["total"]
+        self.v_prog.set(f"{human_size(tb)} in {tn:,} files · {time.time() - self._t0:.1f} s"
+                        " (from the index - Rebuild index if the disk changed a lot)")
+        self._fill_files(res["files"])
+        self._fill_dirs(res["trees"])
+        self._fill_types(res["exts"], res["total"])
+
+    def _fill_files(self, rows):
+        t = self.t_files
+        t.delete(*t.get_children())
+        self.file_rows.clear()
+        for r in rows:
+            iid = t.insert("", "end", values=(r[1], os.path.dirname(r[0]), human_size(r[3] or 0),
+                                              self.app.fmt_time(r[4]), r[2]))
+            self.file_rows[iid] = r
+
+    def _dir_values(self, size, files, parent_size):
+        pct = (size * 100.0 / parent_size) if parent_size else 0.0
+        bar = "█" * int(round(pct / 10)) if parent_size else ""
+        return (human_size(size), f"{files:,}", f"{pct:.1f} %" if parent_size else "", bar)
+
+    def _fill_dirs(self, trees):
+        t = self.t_dirs
+        t.delete(*t.get_children())
+        self.nodes.clear()
+        self.kids = []
+        for ti, (root, top, agg, direct) in enumerate(trees):
+            kids = collections.defaultdict(list)
+            for k in agg:
+                if len(k) > len(top):
+                    i = k.rfind("\\")
+                    kids[k[:i] if i >= 0 else ""].append(k)
+            self.kids.append(kids)
+            size, files = agg.get(top, [0, 0])
+            iid = t.insert("", "end", text=os.path.join(root, top) if top else root,
+                           values=self._dir_values(size, files, 0), open=False)
+            self.nodes[iid] = (ti, top)
+            self._add_placeholder(iid, ti, top)
+        roots = t.get_children()
+        if len(roots) == 1:
+            t.item(roots[0], open=True)
+            self._populate(roots[0])
+
+    def _add_placeholder(self, iid, ti, rel):
+        root, top, agg, direct = self.result["trees"][ti]
+        if self.kids[ti].get(rel) or direct.get(rel):
+            self.t_dirs.insert(iid, "end", text="…")
+
+    def _dir_open(self, event=None):
+        iid = self.t_dirs.focus()
+        if iid in self.nodes:
+            self._populate(iid)
+
+    def _populate(self, iid):
+        t = self.t_dirs
+        ch = t.get_children(iid)
+        if not (len(ch) == 1 and ch[0] not in self.nodes and t.item(ch[0], "text") == "…"):
+            return  # already filled
+        t.delete(*ch)
+        ti, rel = self.nodes[iid]
+        root, top, agg, direct = self.result["trees"][ti]
+        psize = agg.get(rel, [0, 0])[0]
+        entries = [(agg[k][0], agg[k][1], k) for k in self.kids[ti].get(rel, [])]
+        d = direct.get(rel)
+        if d:
+            entries.append((d[0], d[1], None))
+        entries.sort(key=lambda x: (-x[0], (x[2] or "").lower()))
+        for size, files, k in entries:
+            if k is None:
+                t.insert(iid, "end", text=f"[{files:,} file(s) directly in this folder]", tags=("direct",),
+                         values=self._dir_values(size, files, psize))
+                continue
+            c = t.insert(iid, "end", text=k[k.rfind("\\") + 1:], values=self._dir_values(size, files, psize))
+            self.nodes[c] = (ti, k)
+            self._add_placeholder(c, ti, k)
+
+    def _fill_types(self, exts, total):
+        tb = total[0] or 1
+        for t in (self.t_cats, self.t_exts):
+            t.delete(*t.get_children())
+        pct = lambda b: f"{b * 100.0 / tb:5.1f} %"
+        cats = type_category_totals(exts)
+        known = set()
+        for tdef in TYPES.values():
+            if tdef and tdef != "<dir>":
+                known |= set(tdef.split())
+        for name, (b, n) in sorted(cats.items(), key=lambda x: -x[1][0]):
+            if not n:
+                continue
+            members = set(TYPES[name].split()) if name in TYPES else None
+            p = self.t_cats.insert("", "end", text=name, values=(human_size(b), f"{n:,}", pct(b)))
+            sub = [(e, v) for e, v in exts.items() if (e in members if members is not None else e not in known)]
+            for e, (eb, en) in sorted(sub, key=lambda x: -x[1][0]):
+                self.t_cats.insert(p, "end", text="." + e if e else "(no extension)",
+                                   values=(human_size(eb), f"{en:,}", pct(eb)))
+        for e, (b, n) in sorted(exts.items(), key=lambda x: -x[1][0]):
+            self.t_exts.insert("", "end", values=("." + e if e else "(no extension)", human_size(b), f"{n:,}", pct(b)))
+
+    # ---- actions
+    def _current(self):
+        """(full path, isdir) of the selected item on the visible tab, or None."""
+        tab = self.nb.index(self.nb.select())
+        if tab == 0:
+            sel = [i for i in self.t_files.selection() if i in self.file_rows]
+            return (self.file_rows[sel[0]][0], False) if sel else None
+        if tab == 1:
+            sel = self.t_dirs.selection()
+            if not sel:
+                return None
+            iid = sel[0]
+            if iid not in self.nodes:  # "[files directly here]" row -> its folder
+                iid = self.t_dirs.parent(iid)
+                if iid not in self.nodes:
+                    return None
+            ti, rel = self.nodes[iid]
+            root = self.result["trees"][ti][0]
+            return (os.path.join(root, rel) if rel else root, True)
+        return None
+
+    def _on_double(self, event):
+        t = event.widget
+        item = t.identify_row(event.y)
+        if not item:
+            return
+        t.selection_set(item)
+        t.focus(item)
+        self.open_selected()  # folders open in Explorer; expand them with the ▸ arrow
+        return "break"
+
+    def _context_menu(self, event):
+        t = event.widget
+        item = t.identify_row(event.y)
+        if item:
+            t.selection_set(item)
+            t.focus(item)
+            self.menu.tk_popup(event.x_root, event.y_root)
+
+    def open_selected(self):
+        cur = self._current()
+        if cur:
+            try:
+                os.startfile(cur[0])
+            except OSError as ex:
+                messagebox.showerror(APP, f"Could not open:\n{cur[0]}\n\n{ex}", parent=self)
+
+    def reveal_selected(self):
+        cur = self._current()
+        if cur:
+            subprocess.Popen(f'explorer /select,"{cur[0]}"')
+
+    def copy_path(self):
+        cur = self._current()
+        if cur:
+            self.clipboard_clear()
+            self.clipboard_append(cur[0])
+
+    def search_inside(self):
+        cur = self._current()
+        if not cur:
+            return
+        folder = cur[0] if cur[1] else os.path.dirname(cur[0])
+        if self.app.set_scope_folder(folder):
+            self.app.lift()
+            self.app.search()
+
+    def close(self):
+        self.cancel.set()
+        self.app.space_window = None
+        self.destroy()
+
+
 class App(tk.Tk):
     COLS = ("name", "folder", "size", "modified", "type", "snippet")
 
@@ -1561,6 +2522,23 @@ class App(tk.Tk):
         self._auto_startup = False
         self.roots_dialog = None
         self.dup_window = None
+        self.space_window = None
+        self.saved_dialog = None
+        # search history / saved searches (kept in self.settings)
+        if not isinstance(self.settings.get("history"), list):
+            self.settings["history"] = []
+        if not isinstance(self.settings.get("saved_searches"), list):
+            self.settings["saved_searches"] = []
+        self._hist_after = None
+        # photo dates (EXIF) read in the background
+        self.exif_running = False
+        self.exif_root = None
+        self.exif_cancel = threading.Event()
+        self.exif_queue = []
+        self._exif_user_cancel = False
+        self.rows_taken = False           # the shown rows carry the EXIF date in the date column
+        # file operations
+        self.fileop_running = False
         # preview pane
         self.preview_gen = 0
         self._pv_after = None
@@ -1578,6 +2556,7 @@ class App(tk.Tk):
             self.after(300, self.rebuild_index)
         else:
             self.after(1500, lambda: self._auto_check(startup=True))
+            self.after(2500, self._exif_schedule)  # photo dates of new / changed images
         self.after(AUTO_TICK_MS, self._auto_tick)
         self.entry.focus_set()
 
@@ -1595,7 +2574,8 @@ class App(tk.Tk):
                   "limit": self.v_limit.get(), "pdf": self.v_pdf.get(), "system": self.v_system.get(),
                   "auto": self.v_auto.get(), "sort": self.v_sort.get(), "date_format": self.v_datefmt.get(),
                   "geometry": self.geometry(), "roots": list(self.roots),
-                  "all_roots": self.v_allroots.get(), "preview": self.v_preview.get()})
+                  "all_roots": self.v_allroots.get(), "preview": self.v_preview.get(),
+                  "date_field": self._date_field()})
         w = self._preview_width()
         if w:
             s["preview_width"] = w
@@ -1620,16 +2600,25 @@ class App(tk.Tk):
         top.pack(fill="x")
         ttk.Label(top, text="Search:", font=big).pack(side="left")
         self.v_query = tk.StringVar()
-        self.entry = ttk.Entry(top, textvariable=self.v_query, font=big)
+        # the search box is a combobox: its drop-down lists the recent searches
+        self.entry = ttk.Combobox(top, textvariable=self.v_query, font=big, values=self._history(),
+                                  postcommand=self._history_post)
         self.entry.pack(side="left", fill="x", expand=True, padx=6)
         self.entry.bind("<Return>", lambda e: self.search())
         self.entry.bind("<KeyRelease>", self._on_key)
         self.entry.bind("<Escape>", lambda e: self.v_query.set(""))
+        self.entry.bind("<<ComboboxSelected>>", lambda e: self.search())
         ttk.Button(top, text="Search", command=self.search).pack(side="left")
         self.b_stop = ttk.Button(top, text="Stop", command=self.stop, state="disabled")
         self.b_stop.pack(side="left", padx=(4, 0))
+        ttk.Button(top, text="☆ Save", width=7, command=self.save_search).pack(side="left", padx=(4, 0))
+        self.mb_saved = ttk.Menubutton(top, text="Saved", width=7)
+        self.m_saved = tk.Menu(self.mb_saved, tearoff=0, postcommand=self._saved_menu_post)
+        self.mb_saved["menu"] = self.m_saved
+        self.mb_saved.pack(side="left", padx=(4, 0))
         ttk.Button(top, text="?", width=3, command=self.show_help).pack(side="left", padx=(4, 0))
         ttk.Button(top, text="Find duplicates…", command=self.open_duplicates).pack(side="left", padx=(12, 0))
+        ttk.Button(top, text="Space…", command=self.open_space).pack(side="left", padx=(4, 0))
         self.v_preview = tk.BooleanVar(value=bool(s.get("preview", True)))
         ttk.Checkbutton(top, text="Preview", variable=self.v_preview,
                         command=self._preview_toggled).pack(side="left", padx=(10, 0))
@@ -1683,7 +2672,22 @@ class App(tk.Tk):
 
         row4 = ttk.Frame(self, padding=(8, 0, 8, 6))
         row4.pack(fill="x")
-        ttk.Label(row4, text="Modified date:").pack(side="left")
+        ttk.Label(row4, text="Date:").pack(side="left")
+        self.v_datefield = tk.StringVar(value=DATE_FIELDS[0])
+        if s.get("date_field") == "taken" and pil_modules():
+            self.v_datefield.set(DATE_FIELDS[1])
+        self.cb_datefield = ttk.Combobox(row4, textvariable=self.v_datefield, values=DATE_FIELDS,
+                                         state="readonly", width=13)
+        self.cb_datefield.pack(side="left", padx=(2, 6))
+        self.cb_datefield.bind("<<ComboboxSelected>>", lambda e: self._date_field_changed())
+        if pil_modules():
+            Tooltip(self.cb_datefield, "Modified: the file's modification date.\nTaken (photos): the EXIF "
+                    "'date taken' of photos - date filters, Newest/Oldest and the date column use it; "
+                    "files without an EXIF date are left out. Photo dates are read in the background "
+                    "after indexing.")
+        else:
+            self.cb_datefield.configure(state="disabled")
+            Tooltip(self.cb_datefield, "'Taken (photos)' needs Pillow (pip install pillow) to read EXIF dates.")
         self.v_preset = tk.StringVar(value="Any date")
         cb_date = ttk.Combobox(row4, textvariable=self.v_preset, values=DATE_PRESETS, state="readonly", width=13)
         cb_date.pack(side="left", padx=(2, 10))
@@ -1715,11 +2719,16 @@ class App(tk.Tk):
         cb_fmt.pack(side="right")
         cb_fmt.bind("<<ComboboxSelected>>", lambda e: self._date_format_changed())
         ttk.Label(row4, text="Show dates:").pack(side="right", padx=(8, 2))
-        ttk.Label(row4, text="To is inclusive",
-                  foreground="#666").pack(side="left")
+        self.l_incl = ttk.Label(row4, text="To is inclusive", foreground="#666")
+        self.l_incl.pack(side="left")
+        row4.bind("<Configure>", lambda e: self._fit_row4(row4))
+        for e in self.date_entries.values():
+            Tooltip(e, "Type 2008, 06.2008 or 15.06.2008 (or use 📅). To is inclusive: "
+                       "From 03.2008 To 06.2008 = March through June 2008.")
 
         pane = ttk.PanedWindow(self, orient="vertical")
         pane.pack(fill="both", expand=True, padx=8)
+        self._vpane = pane
         self.hpane = ttk.PanedWindow(pane, orient="horizontal")
         res = ttk.Frame(self.hpane)
         self.tree = ttk.Treeview(res, columns=self.COLS, show="headings", selectmode="extended")
@@ -1777,11 +2786,16 @@ class App(tk.Tk):
         self.menu.add_command(label="Copy name", command=lambda: self.copy_paths(names=True))
         self.menu.add_command(label="Select all", accelerator="Ctrl+A", command=self._select_all)
         self.menu.add_separator()
+        self.menu.add_command(label="Rename…", accelerator="F2", command=self.rename_selected)
+        self.menu.add_command(label="Move to…", command=lambda: self.transfer_selected("move"))
+        self.menu.add_command(label="Copy to…", command=lambda: self.transfer_selected("copy"))
+        self.menu.add_separator()
         self.menu.add_command(label="Delete… (to Recycle Bin)", accelerator="Del",
                               command=self.delete_selected)
+        self.tree.bind("<F2>", lambda e: self.rename_selected())
 
         bar = ttk.Frame(self, padding=(8, 4))
-        bar.pack(fill="x")
+        bar.pack(fill="x", side="bottom", before=self._vpane)  # keeps the status bar visible in a small window
         self.v_status = tk.StringVar(value="Ready.")
         ttk.Label(bar, textvariable=self.v_status).pack(side="left")
         ttk.Button(bar, text="Change root…", command=self.change_root).pack(side="right")
@@ -1803,6 +2817,20 @@ class App(tk.Tk):
         self.v_index = tk.StringVar()
         ttk.Label(bar, textvariable=self.v_index, foreground="#666").pack(side="right", padx=10)
         self._field_changed()
+
+    def _fit_row4(self, row):
+        """Show the 'To is inclusive' hint only when the date row has room for it."""
+        try:
+            need = sum(w.winfo_reqwidth() + 12 for w in row.pack_slaves() if w is not self.l_incl)
+            room = row.winfo_width() - need
+            shown = self.l_incl.winfo_manager() == "pack"
+            if room < self.l_incl.winfo_reqwidth() + 8:
+                if shown:
+                    self.l_incl.pack_forget()
+            elif not shown:
+                self.l_incl.pack(side="left")
+        except tk.TclError:
+            pass
 
     # ---- index management
     def _show_index_status(self):
@@ -1974,6 +3002,11 @@ class App(tk.Tk):
             self.index_queue.clear()
             self.index_cancel.set()
             return
+        if self.exif_running:  # the button reads "Cancel photo dates"
+            self._exif_user_cancel = True
+            self.exif_queue.clear()
+            self.exif_cancel.set()
+            return
         if self.v_allroots.get():  # rebuild every root, one after the other
             self.index_queue = [r for r in self._all_roots()[1:] if os.path.isdir(r)]
         self.rebuild_index()
@@ -1990,6 +3023,8 @@ class App(tk.Tk):
             return
         self._auto_run = auto
         self.indexing = True
+        if self.exif_running:  # the photo-date pass continues after the index build
+            self.exif_cancel.set()
         self.index_cancel.clear()
         self.b_index.configure(text="Cancel indexing")
         root = os.path.abspath(root or self.root_dir)
@@ -2044,8 +3079,21 @@ class App(tk.Tk):
                 "type": self.v_type.get(), "scope": self.v_scope.get(), "min_mb": self.v_min.get().strip(),
                 "max_mb": self.v_max.get().strip(), "date_from": self.v_y1.get().strip(),
                 "date_to": self.v_y2.get().strip(), "limit": self.v_limit.get().strip() or "2000",
-                "sort": self.v_sort.get(),
+                "sort": self.v_sort.get(), "date_field": self._date_field(),
                 "pdf": self.v_pdf.get()}
+
+    def _date_field(self):
+        """'taken' when the date filters / sort use the EXIF date of photos, else 'mtime'."""
+        try:
+            return "taken" if self.v_datefield.get() == DATE_FIELDS[1] and pil_modules() else "mtime"
+        except AttributeError:  # before the UI exists
+            return "mtime"
+
+    def _date_field_changed(self):
+        self._save_settings()
+        if self._date_field() == "taken":
+            self._exif_schedule()
+        self.search()
 
     def open_calendar(self, entry, var):
         def picked():
@@ -2072,14 +3120,52 @@ class App(tk.Tk):
             self.c_pdf.configure(state="normal" if content else "disabled")
         self.tree.column("snippet", width=380 if content else 120)
 
+    NAV_KEYS = {"Return", "KP_Enter", "Escape", "Up", "Down", "Left", "Right", "Home", "End", "Prior", "Next",
+                "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Caps_Lock"}
+
     def _on_key(self, event):
-        if event.keysym in ("Return", "Escape") or self.v_field.get() == "content":
+        if event.keysym in self.NAV_KEYS or self.v_field.get() == "content":
             return
         if self._debounce:
             self.after_cancel(self._debounce)
-        self._debounce = self.after(350, self.search)
+        self._debounce = self.after(350, lambda: self.search(typed=True))
 
-    def search(self):
+    # ---- search history
+    HISTORY_MAX = 30
+    HISTORY_IDLE_MS = 2500  # a search run while typing is remembered once the text stays put
+
+    def _history(self):
+        h = self.settings.get("history")
+        return [x for x in h if isinstance(x, str)] if isinstance(h, list) else []
+
+    def _history_post(self):
+        self.entry.configure(values=self._history())
+        try:  # the drop-down list in the same (big) font as the search box
+            pop = self.tk.call("ttk::combobox::PopdownWindow", self.entry)
+            self.tk.call(f"{pop}.f.l", "configure", "-font", "{Segoe UI} 11")
+        except tk.TclError:
+            pass
+
+    def add_history(self, q):
+        q = (q or "").strip()
+        if not q:
+            return
+        h = [x for x in self._history() if x.strip().lower() != q.lower()]
+        self.settings["history"] = ([q] + h)[:self.HISTORY_MAX]
+        self.entry.configure(values=self.settings["history"])
+        self._save_settings()
+
+    def _history_later(self, q):
+        if self._hist_after:
+            self.after_cancel(self._hist_after)
+
+        def later():
+            self._hist_after = None
+            if self.v_query.get().strip() == q.strip():
+                self.add_history(q)
+        self._hist_after = self.after(self.HISTORY_IDLE_MS, later)
+
+    def search(self, typed=False):
         if self._debounce:
             self.after_cancel(self._debounce)
             self._debounce = None
@@ -2102,6 +3188,14 @@ class App(tk.Tk):
             self.v_status.set(f"Check the filters: {ex}")
             return
         targets, notes = self._search_targets(o["scope"])
+        if o["query"].strip():
+            if typed:
+                self._history_later(o["query"])
+            else:
+                if self._hist_after:
+                    self.after_cancel(self._hist_after)
+                    self._hist_after = None
+                self.add_history(o["query"])
         self.cancel.set()
         self.cancel = threading.Event()
         self.gen += 1
@@ -2109,6 +3203,8 @@ class App(tk.Tk):
         self.rows, self.pending = [], []
         self.row_by_iid.clear()
         self.tree.delete(*self.tree.get_children())
+        self.rows_taken = o["date_field"] == "taken"
+        self.tree.heading("modified", text="Taken" if self.rows_taken else "Modified")
         self._update_hints(o)
         self.b_stop.configure(state="normal")
         self.v_status.set("Searching…")
@@ -2120,6 +3216,10 @@ class App(tk.Tk):
         db, root = self.db, self.root_dir
         if not multi:
             o["scope"] = targets[0][2]  # absolute Look in folder -> relative to the root
+        if self.rows_taken:
+            notes = ", ".join(x for x in (notes, "photos with an EXIF date only"
+                                          + (" - still reading photo dates" if self.exif_running else ""))
+                              if x)
         note_txt = f"  ·  {notes}" if notes else ""
 
         def work_multi():
@@ -2201,6 +3301,15 @@ class App(tk.Tk):
                     self.v_index.set(f"Indexing {self.index_root} … {msg[1]:,} items  ({msg[2][-60:]})")
                 elif kind == "idone":
                     self._index_done(msg[1], msg[2])
+                elif kind == "xprog":
+                    if not self.indexing:
+                        self.v_index.set(f"Reading photo dates (EXIF) in {msg[1]} … {msg[2]:,} / {msg[3]:,}")
+                elif kind == "xdone":
+                    self._exif_done(*msg[1:])
+                elif kind == "fprog":
+                    self.v_status.set(msg[1])
+                elif kind == "fdone":
+                    self._transfer_done(*msg[1:])
         except queue.Empty:
             pass
         self._flush_pending()
@@ -2239,10 +3348,74 @@ class App(tk.Tk):
                     self.search()
         else:
             self.index_queue.clear()  # cancelled
+        if n is not None:
+            self._exif_schedule([root], start=False)  # photo dates of the fresh index
         if self.index_queue:
             self.rebuild_index(root=self.index_queue.pop(0))
-        elif was_auto and (n is not None or err):
-            self.after(1000, self._auto_check)  # next stale root, one at a time
+        else:
+            if was_auto and (n is not None or err):
+                self.after(1000, self._auto_check)  # next stale root, one at a time
+            self.after(300, self._exif_next)  # (waits if another index build starts)
+
+    # ---- photo dates (EXIF) in the background
+    def _exif_schedule(self, roots=None, start=True):
+        """Queue an incremental EXIF pass for roots (default: the searched roots)."""
+        if not pil_modules():
+            return
+        if roots is None:
+            roots = self._all_roots() if self.v_allroots.get() else [self.root_dir]
+        for r in roots:
+            k = os.path.normcase(r)
+            if self.exif_running and os.path.normcase(self.exif_root or "") == k:
+                continue
+            if not any(os.path.normcase(q) == k for q in self.exif_queue):
+                self.exif_queue.append(r)
+        if start:
+            self._exif_next()
+
+    def _exif_next(self):
+        if self.exif_running or self.indexing or not self.exif_queue or not pil_modules():
+            return
+        root = self.exif_queue.pop(0)
+        db = db_path_for(root)
+        if index_info(db) is None or not os.path.isdir(root):
+            self.after(10, self._exif_next)
+            return
+        self.exif_running = True
+        self.exif_root = root
+        self._exif_user_cancel = False
+        self.exif_cancel = threading.Event()
+        cancel = self.exif_cancel
+        self.b_index.configure(text="Cancel photo dates")
+
+        def work():
+            try:
+                res = exif_pass(db, root, cancel, lambda i, n: self.q.put(("xprog", root, i, n)))
+                self.q.put(("xdone", root, res, None))
+            except Exception as ex:  # e.g. the index is locked - try again later
+                self.q.put(("xdone", root, None, str(ex)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _exif_done(self, root, res, err):
+        self.exif_running = False
+        self.exif_root = None
+        if not self.indexing:
+            self.b_index.configure(text="Rebuild index")
+        if res is None and not err and not self._exif_user_cancel:
+            self.exif_queue.insert(0, root)  # interrupted by an index build: continue afterwards
+        if not self.indexing:
+            self._show_index_status()
+        if err:
+            self.v_status.set(f"Reading photo dates failed: {err}")
+        elif res is not None and res[1]:
+            images, read, dated = res
+            self.v_status.set(f"Photo dates read: {read:,} new/changed image(s) in {root}, {dated:,} with an EXIF "
+                              f"date" + (" - search again to include them." if self._date_field() == "taken" else "."))
+        elif res is None and self._exif_user_cancel:
+            self.v_status.set("Reading photo dates stopped (continues at the next index refresh).")
+        if not self._exif_user_cancel:
+            self.after(200, self._exif_next)
 
     def _flush_pending(self):
         n = 0
@@ -2255,14 +3428,14 @@ class App(tk.Tk):
             self._insert_row(r)
             n += 1
 
-    def _insert_row(self, r):
+    def _row_values(self, r):
         rel, name, ext, size, mtime, isdir, snippet = r
+        return (("📁 " if isdir else "") + name, os.path.dirname(rel) or ".", "" if isdir else human_size(size),
+                self.fmt_time(mtime), "folder" if isdir else ext, snippet)
+
+    def _insert_row(self, r):
         self.rows.append(r)
-        folder = os.path.dirname(rel)
-        iid = self.tree.insert("", "end", tags=("dir",) if isdir else (), values=(
-            ("📁 " if isdir else "") + name, folder or ".", "" if isdir else human_size(size),
-            self.fmt_time(mtime),
-            "folder" if isdir else ext, snippet))
+        iid = self.tree.insert("", "end", tags=("dir",) if r[5] else (), values=self._row_values(r))
         self.row_by_iid[iid] = r
 
     def fmt_time(self, ts):
@@ -2548,8 +3721,9 @@ class App(tk.Tk):
         self._pv_path = path
         self.v_pv_name.set(("📁 " if r[5] else "") + r[1])
         self.v_pv_path.set(path)
+        when = "taken" if self.rows_taken else "modified"
         self.v_pv_info.set("Folder" + (f"  ·  modified {self.fmt_time(r[4])}" if r[4] else "") if r[5]
-                           else f"{human_size(r[3] or 0)}  ·  modified {self.fmt_time(r[4])}")
+                           else f"{human_size(r[3] or 0)}  ·  {when} {self.fmt_time(r[4])}")
         self.v_pv_extra.set("")
         self.pv_b_open.configure(state="normal")
         self.pv_b_reveal.configure(state="normal")
@@ -2603,6 +3777,430 @@ class App(tk.Tk):
             self.dup_window.focus_set()
             return
         self.dup_window = DupWindow(self)
+
+    # ---- disk space
+    def open_space(self):
+        if self.space_window is not None and self.space_window.winfo_exists():
+            self.space_window.lift()
+            self.space_window.focus_set()
+            self.space_window.start()  # recalculate with the current filters
+            return
+        self.space_window = SpaceWindow(self)
+
+    def set_scope_folder(self, folder, parent=None):
+        """Put an absolute folder into Look in (relative to the root unless 'Search all roots').
+        Returns False (after telling the user) when the folder is outside the root(s)."""
+        d = os.path.abspath(folder)
+        if self.v_allroots.get():
+            if any(path_in(d, r) for r in self._all_roots()):
+                self.v_scope.set(d)  # a root itself = search only that root
+                return True
+            messagebox.showinfo(APP, "That folder is not inside any of the roots. Add it with 'Roots…'.",
+                                parent=parent or self)
+            return False
+        if path_in(d, self.root_dir):
+            self.v_scope.set(rel_to(d, self.root_dir))
+            return True
+        messagebox.showinfo(APP, "That folder is outside the indexed root. Use 'Change root…' instead.",
+                            parent=parent or self)
+        return False
+
+    # ---- saved searches
+    def saved_searches(self):
+        lst = self.settings.get("saved_searches")
+        if not isinstance(lst, list):
+            lst = self.settings["saved_searches"] = []
+        return lst
+
+    def _search_state(self):
+        """Everything needed to repeat the current search."""
+        return {"query": self.v_query.get(), "field": self.v_field.get(), "regex": self.v_regex.get(),
+                "type": self.v_type.get(), "scope": self.v_scope.get().strip(), "min_mb": self.v_min.get().strip(),
+                "max_mb": self.v_max.get().strip(), "date_from": self.v_y1.get().strip(),
+                "date_to": self.v_y2.get().strip(), "preset": self.v_preset.get(), "sort": self.v_sort.get(),
+                "all_roots": self.v_allroots.get(), "date_field": self._date_field()}
+
+    @staticmethod
+    def describe_saved(s):
+        parts = [f"\"{s.get('query', '')}\"" if s.get("query") else "(no words)"]
+        if s.get("field") == "content":
+            parts.append("in contents")
+        if s.get("regex"):
+            parts.append("regex")
+        if s.get("type") and s.get("type") != "All files and folders":
+            parts.append(s["type"])
+        if s.get("scope"):
+            parts.append("in " + s["scope"])
+        if s.get("min_mb") or s.get("max_mb"):
+            parts.append(f"{s.get('min_mb') or '0'}…{s.get('max_mb') or '∞'} MB")
+        if s.get("preset") not in (None, "", "Any date", "Custom"):
+            parts.append(s["preset"])
+        elif s.get("date_from") or s.get("date_to"):
+            parts.append(f"{s.get('date_from') or '…'} to {s.get('date_to') or '…'}")
+        if s.get("date_field") == "taken":
+            parts.append("date taken")
+        if s.get("sort") and s.get("sort") != "Best match":
+            parts.append(s["sort"].lower())
+        if s.get("all_roots"):
+            parts.append("all roots")
+        return " · ".join(parts)
+
+    def save_search(self):
+        state = self._search_state()
+        name = simpledialog.askstring(APP + " - save search",
+                                      "Name for this search (query, Match in, Type, Look in, size, date and sort "
+                                      "are saved):", initialvalue=state["query"].strip()[:60], parent=self)
+        name = (name or "").strip()
+        if not name:
+            return
+        lst = self.saved_searches()
+        state = dict(state, name=name)
+        for i, s in enumerate(lst):
+            if s.get("name") == name:
+                if not messagebox.askyesno(APP, f"Replace the saved search '{name}'?", default="no", parent=self):
+                    return
+                lst[i] = state
+                break
+        else:
+            lst.append(state)
+        self._save_settings()
+        self.v_status.set(f"Saved search '{name}'. Run it again from 'Saved'.")
+        if self.saved_dialog is not None and self.saved_dialog.winfo_exists():
+            self.saved_dialog.refresh()
+
+    def restore_saved(self, s):
+        """Put every field of a saved search back and run it."""
+        multi = bool(s.get("all_roots"))
+        if multi != self.v_allroots.get():
+            self.v_allroots.set(multi)
+            self._refresh_scopes()
+            self._show_index_status()
+            if multi:
+                self.after(500, self._auto_check)
+        self.v_query.set(s.get("query", ""))
+        self.v_field.set(s.get("field") if s.get("field") in ("name", "path", "content") else "path")
+        self.v_regex.set(bool(s.get("regex")))
+        self.v_type.set(s.get("type") if s.get("type") in TYPES else "All files and folders")
+        self.v_scope.set(s.get("scope", ""))
+        self.v_min.set(s.get("min_mb", ""))
+        self.v_max.set(s.get("max_mb", ""))
+        self.v_y1.set(s.get("date_from", ""))
+        self.v_y2.set(s.get("date_to", ""))
+        preset = s.get("preset") if s.get("preset") in DATE_PRESETS else "Any date"
+        if preset not in ("Any date", "Custom"):  # relative presets (Last 7 days…) mean "from today"
+            self.v_y1.set(date_preset(preset)[0])
+            self.v_y2.set(date_preset(preset)[1])
+        self.v_preset.set(preset)
+        self.v_sort.set(s.get("sort") if s.get("sort") in SORTS else "Best match")
+        want_taken = s.get("date_field") == "taken"
+        self.v_datefield.set(DATE_FIELDS[1] if want_taken and pil_modules() else DATE_FIELDS[0])
+        self._field_changed()
+        self._save_settings()
+        if want_taken and not pil_modules():
+            self.v_status.set("This saved search uses the photo date - install Pillow for it. Searching by Modified.")
+        if want_taken:
+            self._exif_schedule()
+        self.search()
+
+    def _saved_menu_post(self):
+        m = self.m_saved
+        m.delete(0, "end")
+        lst = self.saved_searches()
+        for s in lst:
+            m.add_command(label=s.get("name", "?"), command=lambda s=s: self.restore_saved(s))
+        if not lst:
+            m.add_command(label="(no saved searches yet - use ☆ Save)", state="disabled")
+        m.add_separator()
+        m.add_command(label="Manage…", command=self.manage_saved)
+
+    def manage_saved(self):
+        if self.saved_dialog is not None and self.saved_dialog.winfo_exists():
+            self.saved_dialog.lift()
+            self.saved_dialog.refresh()
+            return
+        self.saved_dialog = SavedDialog(self)
+
+    # ---- rename / move / copy
+    def _rel_for(self, full):
+        """Result-row rel for an absolute path: relative to the root in single-root mode when
+        possible, else the absolute path (self._full() handles both)."""
+        if not self.v_allroots.get() and path_in(full, self.root_dir):
+            rel = rel_to(full, self.root_dir)
+            if rel:
+                return rel
+        return full
+
+    def _unique_selection(self):
+        """Selected rows without the items inside selected folders: ([(row, full path)], skipped)."""
+        by_key = {}
+        for r in self._selected():
+            p = os.path.normpath(self._full(r))
+            by_key.setdefault(os.path.normcase(p), (r, p))
+        prefixes = tuple(k + os.sep for k, (r, p) in by_key.items() if r[5])
+        items = [v for k, v in sorted(by_key.items()) if not (prefixes and k.startswith(prefixes))]
+        return items, len(by_key) - len(items)
+
+    def rename_selected(self):
+        if self.fileop_running:
+            self.v_status.set("Please wait - a move / copy is still running.")
+            return
+        sel = self._selected()
+        if len(sel) != 1:
+            self.v_status.set("Select exactly one item to rename (F2).")
+            return
+        r = sel[0]
+        src = os.path.normpath(self._full(r))
+        if not os.path.lexists(src):
+            messagebox.showerror(APP, f"This item no longer exists:\n{src}", parent=self)
+            return
+        new = simpledialog.askstring(APP + " - rename", f"New name for\n{src}", initialvalue=r[1], parent=self)
+        if new is None:
+            return
+        new = new.strip()
+        problem = None
+        if not new or new in (".", ".."):
+            problem = "The name is empty."
+        elif any(c in INVALID_NAME_CHARS for c in new) or any(ord(c) < 32 for c in new):
+            problem = 'A name cannot contain any of these characters:  \\ / : * ? " < > |'
+        elif new.endswith("."):
+            problem = "Windows does not allow a name that ends with a dot."
+        if problem:
+            messagebox.showerror(APP + " - rename", problem, parent=self)
+            return
+        if new == r[1] and new == os.path.basename(src):
+            return
+        dst = os.path.join(os.path.dirname(src), new)
+        if os.path.lexists(dst) and os.path.normcase(dst) != os.path.normcase(src):
+            messagebox.showerror(APP + " - rename", f"An item with that name already exists:\n{dst}", parent=self)
+            return
+        try:
+            os.rename(src, dst)
+        except OSError as ex:
+            messagebox.showerror(APP + " - rename", f"Could not rename\n{src}\n\n{ex}\n\nNothing was changed.",
+                                 parent=self)
+            return
+        ok = self._after_transfer([(src, dst)], "move")
+        self.v_status.set(f"Renamed to {new}" + ("" if ok else " · index not updated - use Rebuild index") + ".")
+
+    def transfer_selected(self, op):
+        try:
+            self._transfer_selected(op)
+        except Exception as ex:  # never let a file operation problem crash the app
+            self._busy(False)
+            self.fileop_running = False
+            messagebox.showerror(APP, f"{op.capitalize()} failed:\n{ex}", parent=self)
+
+    def _transfer_selected(self, op):
+        verb = "Move" if op == "move" else "Copy"
+        if self.fileop_running:
+            self.v_status.set("Please wait - a move / copy is still running.")
+            return
+        items, inside = self._unique_selection()
+        if not items:
+            self.v_status.set(f"Select one or more results to {op} (Ctrl/Shift+click, Ctrl+A).")
+            return
+        initial = self.settings.get("fileop_dir")
+        if not initial or not os.path.isdir(initial):
+            initial = os.path.dirname(items[0][1])
+        dest = filedialog.askdirectory(parent=self, initialdir=initial,
+                                       title=f"{verb} {len(items):,} item(s) to which folder?")
+        if not dest:
+            return
+        dest = os.path.normpath(os.path.abspath(dest))
+        if not os.path.isdir(dest):
+            messagebox.showerror(APP, f"The destination folder does not exist:\n{dest}", parent=self)
+            return
+        self.settings["fileop_dir"] = dest
+        plan, conflicts, skipped, planned = [], [], {}, set()
+        for r, src in items:
+            isdir = _is_dir(src) if os.path.lexists(src) else bool(r[5])
+            if not os.path.lexists(src):
+                skipped[src] = "no longer exists"
+                continue
+            if isdir and path_in(dest, src):
+                skipped[src] = "the destination is inside this folder"
+                continue
+            if op == "move" and os.path.normcase(os.path.dirname(src)) == os.path.normcase(dest):
+                skipped[src] = "already in that folder"
+                continue
+            dst = os.path.join(dest, os.path.basename(src))
+            if os.path.lexists(dst) or os.path.normcase(dst) in planned:
+                conflicts.append((r, src, dst, isdir))
+            else:
+                plan.append((r, src, dst, False))
+                planned.add(os.path.normcase(dst))
+        mode = None
+        if conflicts:
+            mode = ask_conflict(self, op, len(conflicts), [c[2] for c in conflicts])
+            if mode is None:
+                self.v_status.set(f"{verb} cancelled.")
+                return
+            if mode == "overwrite" and not messagebox.askyesno(
+                    APP + " - overwrite",
+                    f"REPLACE {len(conflicts):,} existing item(s) at the destination?\n\n"
+                    + "\n".join(c[2] for c in conflicts[:10]) + (f"\n… and {len(conflicts) - 10:,} more"
+                                                                 if len(conflicts) > 10 else "")
+                    + "\n\nThe replaced files / folders are deleted permanently (not to the Recycle Bin) once "
+                      "the new item is in place. If anything fails they are restored.",
+                    icon="warning", default="no", parent=self):
+                self.v_status.set(f"{verb} cancelled.")
+                return
+            for r, src, dst, isdir in conflicts:
+                k = os.path.normcase(dst)
+                if mode == "skip":
+                    skipped[src] = "exists at the destination (skipped)"
+                elif mode == "keep":
+                    dst = os.path.join(dest, keep_both_name(dest, os.path.basename(src), isdir, planned))
+                    plan.append((r, src, dst, False))
+                    planned.add(os.path.normcase(dst))
+                elif k in planned or os.path.normcase(src) == k:
+                    skipped[src] = "same name as another selected item" if k in planned else "it is the same item"
+                elif path_in(src, dst):
+                    skipped[src] = "it is inside the item it would replace"
+                else:
+                    plan.append((r, src, dst, True))
+                    planned.add(k)
+        if not plan:
+            lines = [f"{p}\n    → {why}" for p, why in list(skipped.items())[:10]]
+            messagebox.showinfo(APP, f"Nothing to {op}:\n\n" + "\n".join(lines), parent=self)
+            return
+        files = [x for x in plan if not x[0][5]]
+        dirs = [x for x in plan if x[0][5]]
+        parts = []
+        if files:
+            parts.append(f"{len(files):,} file(s), {human_size(sum(x[0][3] or 0 for x in files))}")
+        if dirs:
+            n_in = s_in = 0
+            known = True
+            for x in dirs:
+                n, s = self._folder_content_info(x[1])
+                if n is None:
+                    known = False
+                    break
+                n_in, s_in = n_in + n, s_in + s
+            parts.append(f"{len(dirs):,} folder(s)" + (f" with {n_in:,} items, {human_size(s_in)}" if known else ""))
+        msg = (f"{verb} {len(plan):,} item(s) ({'; '.join(parts)})\n\nto:  {dest}\n\n"
+               + "\n".join(x[1] for x in plan[:10]) + (f"\n… and {len(plan) - 10:,} more" if len(plan) > 10 else ""))
+        if inside:
+            msg += f"\n\n({inside:,} selected item(s) are inside selected folders and go with them.)"
+        n_over = sum(1 for x in plan if x[3])
+        n_keep = sum(1 for x in plan if os.path.basename(x[2]) != os.path.basename(x[1]))
+        if n_over:
+            msg += f"\n\n{n_over:,} existing item(s) at the destination will be REPLACED."
+        if n_keep:
+            msg += f"\n\n{n_keep:,} item(s) get a new name like 'name (2)' because the name exists."
+        if skipped:
+            msg += f"\n\n{len(skipped):,} item(s) skipped (" + "; ".join(sorted(set(skipped.values()))) + ")."
+        if op == "move" and any(not same_volume(x[1], dest) for x in plan):
+            msg += ("\n\nThe destination is on another drive: the items are copied first and each original is "
+                    "deleted only after its copy is complete.")
+        if not messagebox.askyesno(APP + " - " + op, msg, icon="warning" if op == "move" else "question",
+                                   default="no", parent=self):
+            self.v_status.set(f"{verb} cancelled.")
+            return
+        self._save_settings()
+        self.fileop_running = True
+        self._busy(True)
+        work_plan = [(src, dst, over) for r, src, dst, over in plan]
+        ing = "Moving" if op == "move" else "Copying"
+
+        def work():
+            done, failures, notes = [], {}, {}
+            for i, (src, dst, over) in enumerate(work_plan, 1):
+                self.q.put(("fprog", f"{ing} {i:,}/{len(work_plan):,}: {src}"))
+                try:
+                    note = transfer_item(src, dst, op, over)
+                    done.append((src, dst))
+                    if note:
+                        notes[src] = note
+                except Exception as ex:  # reported after all items
+                    failures[src] = str(ex)
+            self.q.put(("fdone", op, dest, done, failures, notes, skipped))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _transfer_done(self, op, dest, done, failures, notes, skipped):
+        self.fileop_running = False
+        self._busy(False)
+        ok = self._after_transfer(done, op)
+        status = f"{'Moved' if op == 'move' else 'Copied'} {len(done):,} item(s) to {dest}"
+        if skipped:
+            status += f" · {len(skipped):,} skipped"
+        if failures:
+            status += f" · {len(failures):,} failed"
+        if not ok:
+            status += " · index not updated - use Rebuild index"
+        self.v_status.set(status + ".")
+        if failures or notes:
+            lines = [f"{p}\n    → {why}" for p, why in list(failures.items())[:15]]
+            if len(failures) > 15:
+                lines.append(f"… and {len(failures) - 15:,} more")
+            lines += [f"{p}\n    → {why}" for p, why in list(notes.items())[:10]]
+            messagebox.showwarning(
+                APP + " - " + op, (f"{len(failures):,} item(s) could not be {'moved' if op == 'move' else 'copied'} "
+                                   "(in use, no permission, disk full…). They are unchanged at their original "
+                                   "place - nothing was lost.\n\n" if failures else "") + "\n".join(lines), parent=self)
+
+    def _after_transfer(self, pairs, op):
+        """Update the indexes (and, for a move / rename, the result list) after items were
+        moved / copied from src to dst. Returns False if an index could not be updated."""
+        ok = True
+        for src, dst in pairs:
+            dates = {}
+            for db, rel in self._index_locations(src):
+                try:
+                    dates = dates or exif_get(db, rel)
+                    if op == "move":
+                        index_remove(db, [(rel, True)])
+                except sqlite3.Error:
+                    ok = False
+            if op == "move" and os.path.lexists(src):  # part of a folder could not be removed
+                for root in self._known_roots():
+                    if path_in(src, root) and rel_to(src, root):
+                        try:
+                            index_add(db_path_for(root), root, [src])
+                        except sqlite3.Error:
+                            ok = False
+            for root in self._known_roots():
+                if path_in(dst, root) and rel_to(dst, root):
+                    db = db_path_for(root)
+                    try:
+                        index_add(db, root, [dst])
+                        exif_put(db, rel_to(dst, root), dates)
+                    except sqlite3.Error:
+                        ok = False
+        if op == "move" and pairs:
+            self._relocate_in_results(pairs)
+        self.readme_cache = None
+        self._show_index_status()
+        return ok
+
+    def _relocate_in_results(self, pairs):
+        """Point result rows (and rows inside moved folders) at their new place."""
+        maps = [(os.path.normcase(os.path.normpath(s)), os.path.normpath(s), os.path.normpath(d)) for s, d in pairs]
+
+        def conv(r):
+            full = os.path.normpath(self._full(r))
+            k = os.path.normcase(full)
+            for ks, s, d in maps:
+                if k == ks:
+                    name = os.path.basename(d)
+                    ext = "" if r[5] else os.path.splitext(name)[1][1:].lower()
+                    return (self._rel_for(d), name, ext) + tuple(r[3:])
+                if k.startswith(ks + os.sep):
+                    return (self._rel_for(d + full[len(s):]),) + tuple(r[1:])
+            return None
+
+        for iid, r in list(self.row_by_iid.items()):
+            n = conv(r)
+            if n is not None:
+                self.row_by_iid[iid] = n
+                if self.tree.exists(iid):
+                    self.tree.item(iid, values=self._row_values(n))
+        self.rows = [conv(r) or r for r in self.rows]
+        self.pending = [r if r[0] == "__done__" else (conv(r) or r) for r in self.pending]
+        if self.v_preview.get():
+            self._preview_request()
 
     # ---- deleting
     def _index_locations(self, full):
@@ -2796,23 +4394,7 @@ class App(tk.Tk):
         total, failed = 0, False
         for db, items in by_db.items():
             try:
-                con = sqlite3.connect(db, timeout=5)
-                try:
-                    n = 0
-                    for rel, isdir in items:
-                        f = fold(rel)
-                        n += con.execute("DELETE FROM files WHERE rel = ?", (rel,)).rowcount
-                        if isdir:
-                            n += con.execute("DELETE FROM files WHERE (fpath = ? OR fpath LIKE ? ESCAPE '\\') "
-                                             "AND substr(rel, 1, ?) = ?",
-                                             (f, like_escape(f + "\\") + "%", len(rel) + 1, rel + "\\")).rowcount
-                    if n:
-                        con.execute("UPDATE meta SET v = CAST(MAX(0, CAST(v AS INTEGER) - ?) AS TEXT) "
-                                    "WHERE k = 'count'", (n,))
-                    con.commit()
-                    total += n
-                finally:
-                    con.close()
+                total += index_remove(db, items)  # (also drops their photo dates)
             except sqlite3.Error:
                 failed = True
         return None if failed else total
@@ -2870,7 +4452,8 @@ class App(tk.Tk):
             return
         with open(p, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["full path", "name", "type", "size bytes", "modified", "match in file"])
+            w.writerow(["full path", "name", "type", "size bytes", "taken (EXIF)" if self.rows_taken else "modified",
+                        "match in file"])
             for rel, name, ext, size, mtime, isdir, snip in self.rows:
                 w.writerow([os.path.join(self.root_dir, rel), name, "folder" if isdir else ext, size,
                             self.fmt_time(mtime), snip])
@@ -2908,7 +4491,8 @@ class App(tk.Tk):
             "    (e.g. 'project box dxf').\n"
             "  File contents - looks inside text/code files (asm, c, bas,\n"
             "    txt, html…) and optionally PDFs. Press Enter to start.\n\n"
-            "FILTERS  Type, Look in (folder), size in MB, and Modified date:\n"
+            "FILTERS  Type, Look in (folder), size in MB, and Date (Modified, or\n"
+            "  Taken for photos - see PHOTO DATES):\n"
             "  pick a preset (Today, Last 7 days, This month, Last year…), click 📅\n"
             "  to choose a day (or 'Whole month') on a calendar, or type From / To as\n"
             "  2008, 2008-06, 2008-06-15, 06.2008 or 15.06.2008.\n"
@@ -2916,10 +4500,29 @@ class App(tk.Tk):
             "SORT  Best match / Newest / Oldest / Name / Size / Folder - applied to\n"
             "  ALL matches before Max results cuts the list. The status line shows\n"
             "  'N of M matches' when more exist than are shown.\n\n"
+            "HISTORY  The search box remembers the last 30 searches - open its\n"
+            "  drop-down (▼ or Alt+Down) and pick one to run it again.\n"
+            "SAVED SEARCHES  '☆ Save' stores the whole search (words, Match in,\n"
+            "  Regex, Type, Look in, size, date + Date mode, Sort, all roots) under\n"
+            "  a name. 'Saved' lists them: click one to restore and run it;\n"
+            "  'Manage…' renames, reorders or deletes them.\n\n"
+            "PHOTO DATES  Date: 'Taken (photos)' filters and sorts by the EXIF\n"
+            "  'date taken' of jpg / tif / png / heic photos instead of the file\n"
+            "  date; files without an EXIF date are left out and the date column\n"
+            "  becomes 'Taken'. The dates are read in the background after each\n"
+            "  index build (only new / changed photos; the status line shows the\n"
+            "  progress and 'Cancel photo dates' stops it). Needs Pillow.\n\n"
             "RESULTS  Double-click opens · right-click for Explorer / copy path /\n"
             "  search inside folder · click a column header to sort.\n"
             "  Ctrl/Shift+click selects several · Ctrl+A selects all ·\n"
             "  Ctrl+C copies paths · Enter opens.\n\n"
+            "RENAME / MOVE / COPY  F2 or right-click > Rename… renames one item.\n"
+            "  'Move to…' / 'Copy to…' take the selected files and folders to a\n"
+            "  folder you pick, after a confirmation. If names exist there you\n"
+            "  choose once: Skip, Keep both (adds ' (2)') or Overwrite (asked\n"
+            "  again). Between drives a move copies first and deletes each\n"
+            "  original only after its copy is complete; on any error nothing is\n"
+            "  lost and the failures are listed. The index is updated too.\n\n"
             "DELETE  Del key or right-click > Delete… removes the selected files\n"
             "  and folders after a confirmation. They go to the Recycle Bin\n"
             "  (restore them from there). On removable / network drives there\n"
@@ -2942,6 +4545,12 @@ class App(tk.Tk):
             "  Quick mode compares only the first + last 1 MB. Use the 'Select all\n"
             "  but …' buttons or Ctrl/Shift+click, then 'Delete selected' - the last\n"
             "  copy of a group is never deleted.\n\n"
+            "SPACE  'Space…' shows where the disk space goes, from the index and\n"
+            "  within the Type, Look in, Size and Date filters (all roots too):\n"
+            "  Biggest files (top N), Biggest folders (a tree - sizes include all\n"
+            "  subfolders, children sorted by size, % of the parent folder) and\n"
+            "  By type (per Type category and per extension). Double-click opens,\n"
+            "  right-click: Show in Explorer / Search inside this folder.\n\n"
             "INDEX  Auto-refresh (bottom right) rebuilds the index in the background\n"
             "  when it is older than the chosen interval (default: Daily); searching\n"
             "  keeps working meanwhile. With 'Search all roots' on, the other roots'\n"
@@ -2951,8 +4560,11 @@ class App(tk.Tk):
     def _on_close(self):
         self.cancel.set()
         self.index_cancel.set()
+        self.exif_cancel.set()
         if self.dup_window is not None:
             self.dup_window.cancel.set()
+        if self.space_window is not None:
+            self.space_window.cancel.set()
         self._save_settings()
         self.destroy()
 
