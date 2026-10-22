@@ -4431,10 +4431,45 @@ class App(tk.Tk):
                                       "(About 15 seconds for H:\\all files.)"):
             self.rebuild_index()
 
+    def _indexed_root_for(self, folder):
+        """The deepest already-indexed root that contains folder (or is folder), else None."""
+        cands, seen = [], set()
+        for r in self._all_roots() + indexed_roots():
+            a = os.path.abspath(r)
+            k = os.path.normcase(a)
+            if k in seen:
+                continue
+            seen.add(k)
+            if path_in(folder, a) and os.path.isfile(db_path_for(a)):
+                cands.append(a)
+        return max(cands, key=len) if cands else None
+
+    def _use_folder_in_root(self, folder, root):
+        """Search folder through the existing index of root: switch root if needed, set Look in."""
+        if os.path.normcase(os.path.abspath(root)) != os.path.normcase(self.root_dir):
+            self._set_root(root)
+        self.v_scope.set(rel_to(folder, self.root_dir))
+        self.v_status.set(f"Searching {folder} inside the index of {self.root_dir} - nothing re-indexed.")
+        self.search()
+
     def change_root(self):
         d = filedialog.askdirectory(initialdir=self.root_dir, title="Folder to search")
-        if d:
-            self._set_root(d)
+        if not d:
+            return
+        d = os.path.abspath(d)
+        r = self._indexed_root_for(d)
+        if r and os.path.normcase(r) != os.path.normcase(d):
+            ans = messagebox.askyesnocancel(
+                APP, f"{d}\n\nis already inside the indexed root {r}.\n\n"
+                     f"Yes - search it there: instant, no new index (Look in is set to this folder).\n"
+                     f"No - make it a separate root with its own index (indexes it again).",
+                icon="question", default="yes")
+            if ans is None:
+                return
+            if ans:
+                self._use_folder_in_root(d, r)
+                return
+        self._set_root(d)
 
     def _set_root(self, d):
         """Make d the current root (remembered in the roots list); index it if needed."""
@@ -5502,7 +5537,12 @@ class App(tk.Tk):
         if path_in(d, self.root_dir):
             self.v_scope.set(rel_to(d, self.root_dir))
             return True
-        messagebox.showinfo(APP, "That folder is outside the indexed root. Use 'Change root…' instead.",
+        r = self._indexed_root_for(d)
+        if r:  # inside another already-indexed root: switch to it
+            self._set_root(r)
+            self.v_scope.set(rel_to(d, self.root_dir))
+            return True
+        messagebox.showinfo(APP, "That folder is not inside any indexed root. Use 'Change root…' to index it.",
                             parent=parent or self)
         return False
 
@@ -6204,14 +6244,17 @@ class App(tk.Tk):
             else:
                 messagebox.showinfo(APP, "That folder is not inside any of the roots. Add it with 'Roots…'.")
             return
-        if os.path.normcase(d) == os.path.normcase(root):
-            self.v_scope.set("")
-        elif os.path.normcase(d).startswith(os.path.normcase(root) + os.sep):
-            self.v_scope.set(d[len(root) + 1:])
-        else:
-            messagebox.showinfo(APP, "That folder is outside the indexed root. Use 'Change root…' instead.")
+        if path_in(d, root):  # also right for drive roots such as C:\
+            self.v_scope.set(rel_to(d, root))
+            self.search()
             return
-        self.search()
+        r = self._indexed_root_for(d)
+        if r:  # inside another root that is already indexed: use that index
+            self._use_folder_in_root(d, r)
+            return
+        if messagebox.askyesno(APP, f"{d}\n\nis not inside any indexed root yet.\n\n"
+                                    f"Index it now as a new root?", icon="question"):
+            self._set_root(d)
 
     def export_csv(self):
         if not self.rows:
